@@ -1,0 +1,169 @@
+# ACFly configuration with SLAM odometry input
+#
+/**:
+  ros__parameters:
+    startup_px4_usb_quirk: false
+    fcu_url: "serial:///dev/ttyS3:921600"
+    gcs_url: "udp://0.0.0.0:14556@"
+    fcu_urls: ["udp://0.0.0.0:14557@localhost:14556"]
+    fcu_protocol: "v2.0"
+    tgt_system: 1
+    tgt_component: 1
+
+# --- Router message filter ---
+# 阻止指定 MAVLink msgid 打包进 DDS 发送给 UAS 节点
+# 节约 CPU：免去无用消息的 DDS 序列化/反序列化开销
+/**/mavros_router:
+  ros__parameters:
+    uas_msg_denylist:
+      # 仅保留: GPS(24,124) + 姿态(30,31) + 状态(0,1,148) + IMU(105) + TIMESYNC(266)
+      # 30/31=ATTITUDE/QUATERNION 为 IMU 插件提供融合姿态 → /mavros/imu/data
+      # 105=acfly_odometry 5s对齐, 266=timesync时钟同步
+      - 26   # SCALED_IMU
+      - 27   # RAW_IMU
+      - 29   # SCALED_PRESSURE
+      - 33   # GLOBAL_POSITION_INT
+      - 36   # SERVO_OUTPUT_RAW
+      - 62   # NAV_CONTROLLER_OUTPUT
+      - 65   # RC_CHANNELS
+      - 74   # VFR_HUD
+      - 87   # POSITION_TARGET_GLOBAL_INT
+      - 116  # SCALED_IMU2
+      - 125  # POWER_STATUS
+      - 147  # BATTERY_STATUS
+      - 178  # AHRS2
+
+# --- system plugins ---
+
+/**/sys:
+  ros__parameters:
+    min_voltage: [10.0]
+    disable_diag: false
+    heartbeat_rate: 1.0
+    heartbeat_mav_type: "ONBOARD_CONTROLLER"
+    conn_timeout: 10.0
+
+/**/time:
+  ros__parameters:
+    time_ref_source: "fcu"
+    timesync_mode: MAVLINK
+    timesync_avg_alpha: 0.6
+    timesync_rate: 10.0
+    system_time_rate: 1.0
+
+# --- mavros plugins ---
+
+/**/tdr_radio:
+  ros__parameters:
+    low_rssi: 40
+
+/**/cmd:
+  ros__parameters:
+    use_comp_id_system_control: false
+
+/**/global_position:
+  ros__parameters:
+    frame_id: "map"
+    child_frame_id: "base_link"
+    rot_covariance: 99999.0
+    gps_uere: 1.0
+    use_relative_alt: true
+    tf.send: false
+    tf.frame_id: "map"
+    tf.global_frame_id: "earth"
+    tf.child_frame_id: "base_link"
+
+/**/imu:
+  ros__parameters:
+    frame_id: "base_link"
+    linear_acceleration_stdev: 0.0003
+    angular_velocity_stdev: 0.0003490659
+    orientation_stdev: 1.0
+    magnetic_stdev: 0.0
+
+/**/local_position:
+  ros__parameters:
+    frame_id: "map"
+    tf.send: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "base_link"
+    tf.send_fcu: false
+
+/**/setpoint_accel:
+  ros__parameters:
+    send_force: false
+
+/**/setpoint_attitude:
+  ros__parameters:
+    reverse_thrust: false
+    use_quaternion: false
+    tf.listen: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "target_attitude"
+
+/**/setpoint_raw:
+  ros__parameters:
+    thrust_scaling: 1.0
+
+/**/setpoint_position:
+  ros__parameters:
+    tf.listen: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "target_position"
+    mav_frame: LOCAL_NED
+
+/**/guided_target:
+  ros__parameters:
+    tf.listen: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "target_position"
+
+/**/setpoint_velocity:
+  ros__parameters:
+    mav_frame: LOCAL_NED
+
+/**/mission:
+  ros__parameters:
+    pull_after_gcs: true
+    use_mission_item_int: true
+
+/**/distance_sensor:
+  ros__parameters:
+    config: |
+      rangefinder_pub:
+        id: 0
+        frame_id: "lidar"
+        field_of_view: 0.0
+        send_tf: false
+        sensor_position: {x: 0.0, y: 0.0, z: -0.1}
+      rangefinder_sub:
+        subscriber: true
+        id: 1
+        orientation: PITCH_270
+
+# odometry plugin - for SLAM input via /odin1/odometry
+/**/odometry:
+  ros__parameters:
+    fcu.odom_parent_id_des: "map"
+    fcu.odom_child_id_des: "base_link"
+
+/**/mocap:
+  ros__parameters:
+    use_tf: false
+    use_pose: true
+
+/**/vision_pose:
+  ros__parameters:
+    tf.listen: false
+    tf.frame_id: "map"
+    tf.child_frame_id: "vision_estimate"
+    tf.rate_limit: 10.0
+
+/**/vision_speed:
+  ros__parameters:
+    listen_twist: true
+    twist_cov: true
+
+/**/vibration:
+  ros__parameters:
+    frame_id: "base_link"

@@ -1,0 +1,7 @@
+build/
+install/
+log/
+odin_bag/
+*.db3
+*.pyc
+__pycache__/

@@ -1,0 +1,44 @@
+supervisor:
+  log_dir: "/tmp/acfly_logs"
+  health_check_hz: 2.0
+  graceful_shutdown_timeout_sec: 10.0
+  initial_backoff_sec: 1.0
+  max_backoff_sec: 60.0
+  topic_check_interval_sec: 2.0
+
+processes:
+  - name: mavros
+    command: "ros2"
+    args: ["launch", "mavros", "acfly.launch.py"]
+    auto_restart: true
+    shutdown_timeout_sec: 15.0
+    dependencies: []
+    wait_for_topics: []
+
+  - name: odin1_driver
+    command: "ros2"
+    args: ["run", "odin_ros_driver", "host_sdk_sample"]
+    auto_restart: true
+    dependencies: []
+    wait_for_topics: []
+
+  - name: timesync
+    command: "ros2"
+    args: ["run", "timesync", "time_sync_node"]
+    auto_restart: true
+    dependencies: ["mavros"]
+    wait_for_topics: ["/mavros/time_reference", "/mavros/timesync_status"]
+
+  - name: acfly_odometry
+    command: "ros2"
+    args: ["run", "acfly_odometry", "acfly_odometry_node"]
+    auto_restart: true
+    dependencies: ["mavros", "odin1_driver"]
+    wait_for_topics: ["/mavros/imu/data", "/odin1/odometry_highfreq"]
+
+  - name: bag_logd
+    command: "ros2"
+    args: ["run", "bag_logd", "bag_logd_node"]
+    auto_restart: true
+    dependencies: ["timesync", "acfly_odometry"]
+    wait_for_topics: []

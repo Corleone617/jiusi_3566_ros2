@@ -1,0 +1,80 @@
+# Flight Data Recorder (Black Box) configuration
+#
+# Records only when the vehicle is armed (disarmed -> armed starts new bag,
+# armed -> disarmed closes bag).  Each arm cycle gets independent bag slices.
+#
+# Rotation: every rotation_interval_sec seconds, the current bag directory
+# is closed and a new one is opened.  Old slices are independent rosbag2
+# directories and can be read individually.
+#
+# Disk protection: when free space drops below min_recording_free_space_mb,
+# the oldest bag slices are deleted (oldest first) until free space recovers.
+# The currently active slice is never deleted.
+
+storage_path: "/data/bags"       # Default storage directory (override via --storage CLI)
+
+# Rotation: close current bag dir and open a new one every N seconds.
+# Each rotation creates an independent rosbag2 directory (timestamp-based name).
+# Set to 0 to disable rotation (single bag, no slicing).
+rotation_interval_sec: 300       # Rotate every 300s (5 min)
+
+# Disk space thresholds for recording (in MB)
+min_start_free_space_mb: 2048   # Reject ARM-triggered recording if free space < this
+min_recording_free_space_mb: 2048 # Delete oldest slices if free drops below this
+
+# Disk check interval during recording (seconds)
+disk_check_interval_sec: 5
+
+# Auto-cleanup: when cleanup_mode is "auto", all old bags are deleted
+# on ARM before opening a new bag.  Set to "retain" to keep everything.
+cleanup_mode: "auto"
+
+# Arm-state-triggered recording
+arm_record:
+  enabled: true
+  mavros_state_topic: "/mavros/state"
+
+# Topics to record. Each topic gets a GenericSubscription.
+# qos: "sensor_data" = best_effort (for high-rate sensor topics, may drop messages)
+# qos: "reliable"     = reliable (guaranteed delivery, prefer for recording)
+# depth: queue size (keep_last), larger depth reduces packet loss
+topics:
+  - name: "/odin1/image/compressed"
+    type: "sensor_msgs/msg/CompressedImage"
+    qos: "reliable"
+    depth: 100
+
+  - name: "/odin1/imu"
+    type: "sensor_msgs/msg/Imu"
+    qos: "reliable"
+    depth: 4000
+
+  - name: "/odin1/cloud_raw"
+    type: "sensor_msgs/msg/PointCloud2"
+    qos: "reliable"
+    depth: 100
+
+  - name: "/odin1/odometry_highfreq"
+    type: "nav_msgs/msg/Odometry"
+    qos: "reliable"
+    depth: 4000
+
+  - name: "/odin1/cloud_slam"
+    type: "sensor_msgs/msg/PointCloud2"
+    qos: "reliable"
+    depth: 100
+
+  - name: "/mavros/gpsstatus/gps1/raw"
+    type: "mavros_msgs/msg/GPSRAW"
+    qos: "sensor_data"
+    depth: 100
+
+  - name: "/mavros/imu/data"
+    type: "sensor_msgs/msg/Imu"
+    qos: "sensor_data"
+    depth: 4000
+
+  - name: "/mavros/local_position/pose"
+    type: "geometry_msgs/msg/PoseStamped"
+    qos: "sensor_data"
+    depth: 100

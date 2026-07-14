@@ -1,0 +1,38 @@
+# Time synchronization configuration
+#
+# Subscribes to /mavros/time_reference to bridge GPS time from MAVROS
+# to the companion computer's system clock (CLOCK_REALTIME).
+#
+# Also subscribes to /mavros/timesync_status for RTT measurement,
+# used to compensate one-way transport latency on the time_reference offset.
+#
+# State machine:
+#   INIT      -> BOOTSTRAP (first valid GPS time) -> TRACKING (slew mode)
+#   TRACKING  -> HOLD (GPS timeout)
+#   HOLD      -> TRACKING (GPS restored)
+#
+# Requires CAP_SYS_TIME for clock_settime / adjtimex:
+#   sudo setcap cap_sys_time+ep install/timesync/lib/timesync/time_sync_node
+
+mavros_time_sync:
+  ros__parameters:
+    # Number of offset samples kept in the sliding window for smoothing
+    window_size: 300
+
+    # Offset threshold (ms) above which a bootstrap (hard clock_settime) is triggered
+    bootstrap_threshold_ms: 500.0
+
+    # Seconds without a GPS time reference before entering HOLD state
+    gps_timeout_sec: 5.0
+
+    # Minimum GPS year considered valid (rejects epoch/wrong timestamps)
+    min_gps_year: 2020
+
+    # Grace period (seconds) after bootstrap before offset threshold checking resumes
+    post_bootstrap_grace_sec: 3.0
+
+    # Interval (seconds) between periodic sync accuracy printouts
+    print_interval_sec: 5.0
+
+    # Maximum RTT (ms) for latency compensation. RTT above this skips compensation.
+    rtt_max_ms: 50.0
