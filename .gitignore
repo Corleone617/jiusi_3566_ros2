@@ -1,7 +1,7 @@
 build/
 install/
 log/
-odin_bag/
+src/tools/odin_bag/
 *.db3
 *.pyc
 __pycache__/

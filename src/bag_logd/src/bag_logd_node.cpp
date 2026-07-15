@@ -183,12 +183,14 @@ public:
     } else {
       // 非武装模式：立即开始录制
       ensure_storage_dir();
+      cleanup_old_bags();
       try {
         {
           std::lock_guard<std::mutex> lock(writer_mutex_);
           open_new_bag();
           recording_ = true;
         }
+        start_rotation_timer();
       } catch (const std::exception & e) {
         RCLCPP_ERROR(get_logger(), "Failed to open bag at startup: %s", e.what());
         std::lock_guard<std::mutex> lock(writer_mutex_);
@@ -342,7 +344,7 @@ private:
   // 每 rotation_interval_sec 秒触发一次
   void rotate_bag()
   {
-    if (!armed_ || !recording_) return;             // 未录制中，跳过
+    if (!recording_) return;                        // 未录制中，跳过
     if (!writer_ || current_bag_path_.empty()) return;
 
     RCLCPP_INFO(get_logger(), "Rotating bag — closing current slice");
@@ -350,7 +352,7 @@ private:
 
     try {
       std::lock_guard<std::mutex> lock(writer_mutex_);
-      if (!armed_) {                                 // 旋转期间上锁，终止
+      if (cfg_.arm_record_enabled && !armed_) {        // 旋转期间上锁，终止
         RCLCPP_WARN(get_logger(), "Disarmed during rotation, recording aborted");
         return;
       }
@@ -418,7 +420,9 @@ private:
 
       RCLCPP_INFO(get_logger(), "DISARMED — closing bag");
       recording_ = false;
-      stop_rotation_timer();
+      if (cfg_.arm_record_enabled) {
+        stop_rotation_timer();
+      }
       close_writer();                                // flush + 关闭当前切片
     }
   }
@@ -428,7 +432,7 @@ private:
   // 永远不删除当前活跃切片
   void disk_check_cb()
   {
-    if (!armed_ || !recording_) return;              // 未录制中，跳过
+    if (!recording_) return;                         // 未录制中，跳过
 
     int64_t free_mb = disk_free_mb(cfg_.storage_path);
     if (free_mb < 0) {
