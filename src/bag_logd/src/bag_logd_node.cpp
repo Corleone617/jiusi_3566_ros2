@@ -54,7 +54,6 @@ struct Config {
   std::string mavros_state_topic = "/mavros/state";  // 飞控状态话题
   std::vector<TopicConfig> topics;            // 录制话题清单
 
-  int min_start_free_space_mb = 10240;        // 解锁时最低空闲磁盘 (MB)，不足拒绝录制
   int min_recording_free_space_mb = 2048;     // 录制中最低空闲 (MB)，不足触发删旧切片
   int disk_check_interval_sec = 30;           // 磁盘检查周期 (s)
 };
@@ -88,18 +87,30 @@ int64_t disk_free_mb(const std::string & path)
 void remove_dir(const std::string & path)
 {
   DIR * d = opendir(path.c_str());
-  if (!d) return;
+  if (!d) {
+    fprintf(stderr, "[bag_logd] remove_dir: opendir(%s) failed: %s\n",
+            path.c_str(), strerror(errno));
+    return;
+  }
   struct dirent * entry;
   while ((entry = readdir(d)) != nullptr) {
     if (entry->d_name[0] == '.') continue;
     std::string full = path + "/" + entry->d_name;
     struct stat st;
     if (stat(full.c_str(), &st) == 0) {
-      if (S_ISDIR(st.st_mode)) remove_dir(full); else std::remove(full.c_str());
+      if (S_ISDIR(st.st_mode)) remove_dir(full); else {
+        if (std::remove(full.c_str()) != 0) {
+          fprintf(stderr, "[bag_logd] remove_dir: remove(%s) failed: %s\n",
+                  full.c_str(), strerror(errno));
+        }
+      }
     }
   }
   closedir(d);
-  rmdir(path.c_str());
+  if (rmdir(path.c_str()) != 0) {
+    fprintf(stderr, "[bag_logd] remove_dir: rmdir(%s) failed: %s\n",
+            path.c_str(), strerror(errno));
+  }
 }
 
 // 从 YAML 文件加载配置
@@ -114,12 +125,28 @@ Config load_config(const std::string & config_file)
     if (root["max_bagfile_size_mb"])      cfg.max_bagfile_size_mb = root["max_bagfile_size_mb"].as<int>();
     if (root["cleanup_mode"])             cfg.cleanup_mode = root["cleanup_mode"].as<std::string>();
 
-    if (root["min_start_free_space_mb"])
-      cfg.min_start_free_space_mb = root["min_start_free_space_mb"].as<int>();
     if (root["min_recording_free_space_mb"])
       cfg.min_recording_free_space_mb = root["min_recording_free_space_mb"].as<int>();
     if (root["disk_check_interval_sec"])
       cfg.disk_check_interval_sec = root["disk_check_interval_sec"].as<int>();
+
+    // 合法性校验
+    if (cfg.storage_path.empty()) {
+      fprintf(stderr, "[bag_logd] FATAL: storage_path is empty\n");
+      throw std::runtime_error("storage_path is empty");
+    }
+    if (cfg.min_recording_free_space_mb < 0) {
+      fprintf(stderr, "[bag_logd] WARN: min_recording_free_space_mb is negative, using 0\n");
+      cfg.min_recording_free_space_mb = 0;
+    }
+    if (cfg.disk_check_interval_sec < 1) {
+      fprintf(stderr, "[bag_logd] WARN: disk_check_interval_sec too small, using 5\n");
+      cfg.disk_check_interval_sec = 5;
+    }
+    if (cfg.rotation_interval_sec < 0) {
+      fprintf(stderr, "[bag_logd] WARN: rotation_interval_sec negative, disabling rotation\n");
+      cfg.rotation_interval_sec = 0;
+    }
 
     if (auto ar = root["arm_record"]) {
       if (ar["enabled"])            cfg.arm_record_enabled = ar["enabled"].as<bool>();
@@ -163,8 +190,8 @@ public:
     } else {
       RCLCPP_INFO(get_logger(), "  rotation: disabled (single bag, no slice)");
     }
-    RCLCPP_INFO(get_logger(), "  disk: min_start=%dMB  min_recording=%dMB  check_interval=%ds",
-      cfg_.min_start_free_space_mb, cfg_.min_recording_free_space_mb, cfg_.disk_check_interval_sec);
+    RCLCPP_INFO(get_logger(), "  disk: min_recording=%dMB  check_interval=%ds",
+      cfg_.min_recording_free_space_mb, cfg_.disk_check_interval_sec);
     RCLCPP_INFO(get_logger(), "  cleanup: mode=%s", cfg_.cleanup_mode.c_str());
     RCLCPP_INFO(get_logger(), "  arm_record: %s  topic: %s",
       cfg_.arm_record_enabled ? "ON" : "OFF", cfg_.mavros_state_topic.c_str());
@@ -213,7 +240,10 @@ public:
     disk_check_timer_->cancel();
     if (rotation_timer_) rotation_timer_->cancel();
     std::lock_guard<std::mutex> lock(writer_mutex_);
-    if (writer_) { writer_->close(); writer_.reset(); }
+    if (writer_) {
+      try { writer_->close(); } catch (...) {}
+      writer_.reset();
+    }
   }
 
 private:
@@ -254,7 +284,11 @@ private:
           [this, name = t.name, type = t.type]
           (std::shared_ptr<rclcpp::SerializedMessage> msg) {
             std::scoped_lock<std::mutex> lock(writer_mutex_);
-            if (!writer_) return;                        // 未录制中，丢弃
+            if (!writer_) {
+              RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 60000,
+                "writer not ready, dropping messages (%s)", name.c_str());
+              return;
+            }
             try {
               writer_->write(msg, name, type, this->now());
             } catch (const std::exception & e) {
@@ -313,7 +347,11 @@ private:
   {
     std::lock_guard<std::mutex> lock(writer_mutex_);
     if (!writer_) return;
-    writer_->close();
+    try {
+      writer_->close();
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(get_logger(), "close_writer failed: %s", e.what());
+    }
     writer_.reset();
     current_bag_path_.clear();
     RCLCPP_INFO(get_logger(), "Bag closed");
@@ -359,7 +397,8 @@ private:
       open_new_bag();
       recording_ = true;
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "Failed to open bag after rotation: %s", e.what());
+      RCLCPP_ERROR(get_logger(),
+        "Failed to open bag after rotation — data gap for this slice: %s", e.what());
       writer_.reset();
       recording_ = false;
     }
@@ -375,26 +414,8 @@ private:
       bool expected = false;
       if (!armed_.compare_exchange_strong(expected, true)) return;
 
-      RCLCPP_INFO(get_logger(), "ARMED — checking disk space");
+      RCLCPP_INFO(get_logger(), "ARMED — starting recording");
       ensure_storage_dir();
-
-      // 磁盘空间检查：不足则放弃本次录制，回退 armed_ 标志
-      int64_t free_mb = disk_free_mb(cfg_.storage_path);
-      RCLCPP_INFO(get_logger(), "  Free disk: %ld MB  (need >= %d MB to start)",
-        free_mb, cfg_.min_start_free_space_mb);
-
-      if (free_mb < 0) {
-        RCLCPP_ERROR(get_logger(), "  Cannot query disk space, aborting recording");
-        armed_ = false;                              // 回退，下次解锁可重试
-        return;
-      }
-      if (free_mb < cfg_.min_start_free_space_mb) {
-        RCLCPP_WARN(get_logger(), "  DISK SPACE INSUFFICIENT — recording skipped. "
-          "Free: %ld MB, required: %d MB",
-          free_mb, cfg_.min_start_free_space_mb);
-        armed_ = false;                              // 回退
-        return;
-      }
 
       close_writer();                                // 关闭可能残留的旧 writer
       cleanup_old_bags();                            // 删除所有历史 bag 为本次飞行腾空间
@@ -461,6 +482,10 @@ private:
         dirs.push_back(entry->d_name);
       }
       closedir(d);
+    } else {
+      RCLCPP_ERROR(get_logger(),
+        "  disk_check: opendir(%s) failed: %s",
+        cfg_.storage_path.c_str(), strerror(errno));
     }
 
     // 按时间戳字典序排序（最旧的在前）
@@ -491,7 +516,11 @@ private:
     ensure_storage_dir();
 
     DIR * d = opendir(cfg_.storage_path.c_str());
-    if (!d) return;
+    if (!d) {
+      RCLCPP_ERROR(get_logger(), "cleanup_old_bags: opendir(%s) failed: %s",
+        cfg_.storage_path.c_str(), strerror(errno));
+      return;
+    }
     struct dirent * entry;
     while ((entry = readdir(d)) != nullptr) {
       if (entry->d_name[0] == '.') continue;

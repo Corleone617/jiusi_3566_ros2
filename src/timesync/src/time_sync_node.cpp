@@ -162,7 +162,11 @@ private:
   void handle_init(double smoothed_ms)
   {
     RCLCPP_INFO(get_logger(), "First valid GPS time received, offset: %.1fms", smoothed_ms);
-    do_bootstrap(smoothed_ms);                       // 硬跳一次
+    if (!do_bootstrap(smoothed_ms)) {                  // 硬跳失败则等待下次重试
+      RCLCPP_ERROR(get_logger(),
+        "BOOTSTRAP FAILED — check CAP_SYS_TIME capability, staying in INIT");
+      return;
+    }
     state_ = State::TRACKING;
     synced_ = true;
     publish_synced(true);
@@ -191,7 +195,12 @@ private:
       RCLCPP_WARN(get_logger(),
         "Offset %.1fms exceeds threshold %.1fms, re-bootstrapping",
         smoothed_ms, bootstrap_threshold_ms_);
-      do_bootstrap(smoothed_ms);
+      if (!do_bootstrap(smoothed_ms)) {
+        RCLCPP_ERROR(get_logger(),
+          "re-bootstrap FAILED — check CAP_SYS_TIME, continuing with slew");
+        apply_slew(smoothed_ms);                     // 降级到微调
+        return;
+      }
       bootstrap_time_ = get_clock()->now();
       publish_status("TRACKING: re-bootstrapped (large offset)");
       return;
@@ -211,8 +220,13 @@ private:
     RCLCPP_INFO(get_logger(), "GPS restored from HOLD, offset: %.1fms", smoothed_ms);
 
     if (std::abs(smoothed_ms) > bootstrap_threshold_ms_) {
-      do_bootstrap(smoothed_ms);
-      bootstrap_time_ = get_clock()->now();
+      if (!do_bootstrap(smoothed_ms)) {
+        RCLCPP_ERROR(get_logger(),
+          "HOLD restore bootstrap FAILED — check CAP_SYS_TIME, using slew");
+        apply_slew(smoothed_ms);
+      } else {
+        bootstrap_time_ = get_clock()->now();
+      }
     } else {
       apply_slew(smoothed_ms);
     }
@@ -225,10 +239,10 @@ private:
 
   // 硬跳：用 clock_settime(CLOCK_REALTIME) 一步到位
   // 需要 CAP_SYS_TIME Linux capability
-  void do_bootstrap(double smoothed_ms)
+  bool do_bootstrap(double smoothed_ms)
   {
     int64_t offset_ns = get_median_offset_ns();      // 用中位数而不是平滑值
-    if (offset_ns == 0) return;
+    if (offset_ns == 0) return false;
 
     int64_t host_ns = get_host_time_ns();
     int64_t target_ns = host_ns + offset_ns;
@@ -240,7 +254,7 @@ private:
     if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
       RCLCPP_ERROR(get_logger(),
         "clock_settime failed: %s (need CAP_SYS_TIME?)", strerror(errno));
-      return;
+      return false;
     }
 
     // 硬跳后清除窗口旧数据（旧 offset 已无意义）
@@ -252,6 +266,7 @@ private:
     RCLCPP_INFO(get_logger(),
       "clock_settime: offset was %.2fms (median %.2fms)",
       smoothed_ms, static_cast<double>(offset_ns) / 1e6);
+    return true;
   }
 
   // 微调：用 adjtimex(STA_PLL) 渐进式频率调整

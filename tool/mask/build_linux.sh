@@ -42,7 +42,7 @@ source "$VENV_DIR/bin/activate"
 # 安装Python依赖
 echo "[3/4] 安装Python依赖..."
 pip install --upgrade pip -q
-pip install PyQt6 numpy pyinstaller -q
+pip install PyQt5 numpy pyinstaller -q
 
 # 打包
 echo "[4/4] 使用PyInstaller打包..."

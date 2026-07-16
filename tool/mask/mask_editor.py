@@ -6,7 +6,7 @@ Mask Editor - Odin1鱼眼相机SLAM Mask编辑工具
 import sys
 import os
 import numpy as np
-from PyQt6.QtWidgets import (
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QToolBar, QStatusBar, QFileDialog,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QButtonGroup,
@@ -14,11 +14,11 @@ from PyQt6.QtWidgets import (
     QGraphicsLineItem, QGraphicsRectItem, QGraphicsPolygonItem,
     QSlider
 )
-from PyQt6.QtGui import (
+from PyQt5.QtGui import (
     QImage, QPixmap, QPainter, QColor, QPen, QBrush, QAction,
     QKeySequence, QPolygonF, QCursor, QWheelEvent
 )
-from PyQt6.QtCore import (
+from PyQt5.QtCore import (
     Qt, QPointF, QRectF, pyqtSignal, QObject
 )
 
@@ -36,7 +36,7 @@ class MaskModel(QObject):
 
     def __init__(self):
         super().__init__()
-        self._mask = QImage(self.MASK_W, self.MASK_H, QImage.Format.Format_Grayscale8)
+        self._mask = QImage(self.MASK_W, self.MASK_H, QImage.Format_Grayscale8)
         self._mask.fill(QColor(255, 255, 255))
         self._undo_stack = []
         self._redo_stack = []
@@ -55,7 +55,7 @@ class MaskModel(QObject):
         if img.isNull():
             return False
         img = img.scaled(self.MASK_W, self.MASK_H)
-        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        img = img.convertToFormat(QImage.Format_Grayscale8)
         self._mask = img
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -394,7 +394,7 @@ class MaskCanvas(QGraphicsView):
     def _create_overlay(self, mask):
         """创建检查模式的半透明覆盖层"""
         w, h = mask.width(), mask.height()
-        overlay = QImage(w, h, QImage.Format.Format_ARGB32)
+        overlay = QImage(w, h, QImage.Format_ARGB32)
         overlay.fill(QColor(0, 0, 0, 0))
 
         # 用numpy加速
@@ -420,11 +420,11 @@ class MaskCanvas(QGraphicsView):
         overlay_arr_copy[masked_pixels, 3] = 120   # A
 
         # 写回
-        result = QImage(overlay_arr_copy.data, w, h, w * 4, QImage.Format.Format_ARGB32)
+        result = QImage(overlay_arr_copy.data, w, h, w * 4, QImage.Format_ARGB32)
         return result.copy()  # copy确保data不被释放
 
     def fit_view(self):
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
     # --- 鼠标事件 ---
     def mousePressEvent(self, event):
@@ -484,7 +484,7 @@ class MaskCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        if event.modifiers() & Qt.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
             self.scale(factor, factor)
         else:
@@ -638,7 +638,7 @@ class MaskEditorWindow(QMainWindow):
         # Mask透明度滑块
         self.opacity_label = QLabel("Mask透明度: 45%")
         mode_layout.addWidget(self.opacity_label)
-        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(10, 90)
         self.opacity_slider.setValue(45)
         self.opacity_slider.setTickInterval(10)
@@ -829,7 +829,7 @@ class MaskEditorWindow(QMainWindow):
         reply = QMessageBox.question(
             self, "新建Mask", "确定创建新的空白Mask？当前编辑将丢失。"
         )
-        if reply == QMessageBox.StandardButton.Yes:
+        if reply == QMessageBox.Yes:
             self.model.create_blank()
 
     def _update_coords(self, x, y):
@@ -922,7 +922,7 @@ def main():
     # 初始适应窗口
     window.canvas.fit_view()
 
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
 
 
 if __name__ == '__main__':

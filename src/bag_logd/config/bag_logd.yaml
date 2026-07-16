@@ -19,7 +19,6 @@ storage_path: "/data/bags"       # Default storage directory (override via --sto
 rotation_interval_sec: 300       # Rotate every 300s (5 min)
 
 # Disk space thresholds for recording (in MB)
-min_start_free_space_mb: 2048   # Reject ARM-triggered recording if free space < this
 min_recording_free_space_mb: 6144 # Delete oldest slices if free drops below this
 
 # Disk check interval during recording (seconds)
@@ -27,7 +26,7 @@ disk_check_interval_sec: 5
 
 # Auto-cleanup: when cleanup_mode is "auto", all old bags are deleted
 # on ARM before opening a new bag.  Set to "retain" to keep everything.
-cleanup_mode: "retain"  # "auto" or "retain"
+cleanup_mode: "auto"  # "auto" or "retain"
 
 # Arm-state-triggered recording
 arm_record:
@@ -54,10 +53,10 @@ topics:
     qos: "reliable"
     depth: 100
 
-  - name: "/odin1/odometry_highfreq"
-    type: "nav_msgs/msg/Odometry"
-    qos: "reliable"
-    depth: 4000
+  # - name: "/odin1/odometry"
+  #   type: "nav_msgs/msg/Odometry"
+  #   qos: "reliable"
+  #   depth: 100
 
   - name: "/odin1/cloud_slam"
     type: "sensor_msgs/msg/PointCloud2"
