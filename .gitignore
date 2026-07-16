@@ -6,3 +6,6 @@ odin_bag/
 *.db3
 *.pyc
 __pycache__/
+install_716.zip
+tool/mask/.venv_build/
+*_716.zip
