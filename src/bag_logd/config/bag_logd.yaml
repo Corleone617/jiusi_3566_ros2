@@ -53,10 +53,15 @@ topics:
     qos: "reliable"
     depth: 100
 
-  # - name: "/odin1/odometry"
+  - name: "/odin1/odometry"
+    type: "nav_msgs/msg/Odometry"
+    qos: "reliable"
+    depth: 100
+
+  # - name: "/odin1/odometry_highfreq"
   #   type: "nav_msgs/msg/Odometry"
   #   qos: "reliable"
-  #   depth: 100
+  #   depth: 4000
 
   - name: "/odin1/cloud_slam"
     type: "sensor_msgs/msg/PointCloud2"

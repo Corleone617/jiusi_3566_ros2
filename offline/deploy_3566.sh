@@ -273,8 +273,8 @@ TimeoutStartSec=50
 TimeoutStopSec=30
 KillMode=mixed
 KillSignal=SIGTERM
-StandardOutput=journal
-StandardError=journal
+StandardOutput=file:/tmp/acfly_logs/acfly_daemon.log
+StandardError=file:/tmp/acfly_logs/acfly_daemon.log
 SyslogIdentifier=acfly_daemon
 
 [Install]

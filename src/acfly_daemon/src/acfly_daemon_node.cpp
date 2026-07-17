@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <csignal>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <map>
@@ -91,6 +92,9 @@ public:
 
     // 加载 YAML 配置
     load_config(config_path);
+
+    // 清空旧日志：守护进程每次启动都是一次新会话，旧日志截断避免无限增长
+    truncate_old_logs();
 
     // ---- 发布者 + 服务 ----
     // 状态发布：transient_local QoS 保证新订阅者收到最新值
@@ -217,6 +221,26 @@ private:
     }
   }
 
+  // 截断旧日志：启动时清空所有 *.log 文件，避免磁盘无限增长
+  void truncate_old_logs()
+  {
+    DIR * d = opendir(log_dir_.c_str());
+    if (!d) return;
+    struct dirent * entry;
+    while ((entry = readdir(d)) != nullptr) {
+      std::string name = entry->d_name;
+      if (name.size() < 4 || name.compare(name.size() - 4, 4, ".log") != 0) continue;
+      std::string full = log_dir_ + "/" + name;
+      // truncate 比 unlink 更安全：文件始终存在，子进程 fd 不会断
+      int fd = open(full.c_str(), O_WRONLY | O_TRUNC);
+      if (fd >= 0) {
+        close(fd);
+        RCLCPP_INFO(get_logger(), "  Log truncated: %s", name.c_str());
+      }
+    }
+    closedir(d);
+  }
+
   // 按名称查找被管进程
   ManagedProcess * find_process(const std::string & name)
   {
@@ -252,8 +276,23 @@ private:
   }
 
   // fork + exec 启动子进程
+  // 杀灭同名僵尸进程：防止上次崩溃残留占据 USB/串口等独占资源
+  void kill_zombie(const ManagedProcess & mp)
+  {
+    if (mp.args.empty()) return;
+    std::string pattern = mp.args.back();              // 最后一个 arg 作唯一标识
+    std::string cmd = "pkill -9 -f '" + pattern + "' 2>/dev/null";
+    if (std::system(cmd.c_str()) == 0) {
+      RCLCPP_WARN(get_logger(), "Killed zombie %s before start (pattern: %s)",
+        mp.name.c_str(), pattern.c_str());
+    }
+  }
+
   void start_process(ManagedProcess & mp)
   {
+    // 杀灭同名僵尸进程（上次崩溃残留，避免 USB/串口等资源冲突）
+    kill_zombie(mp);
+
     pid_t pid = fork();
     if (pid < 0) {
       RCLCPP_ERROR(get_logger(), "fork failed for %s: %s",

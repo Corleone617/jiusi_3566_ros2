@@ -5,6 +5,15 @@
       - actuator_control
       - ftp
       - hil
+      - param
+      - waypoint
+      # setpoints (not used)
+      - setpoint_accel
+      - setpoint_attitude
+      - setpoint_position
+      - setpoint_raw
+      - setpoint_trajectory
+      - setpoint_velocity
       # extras
       - adsb
       - altitude
@@ -13,6 +22,7 @@
       - cellular_status
       - companion_process_status
       - debug_value
+      - distance_sensor
       - esc_status
       - esc_telemetry
       - fake_gps
@@ -20,10 +30,13 @@
       - gimbal_control
       - gps_input
       - gps_rtk
+      - guided_target
+      - home_position
       - image_pub
       - landing_target
       - log_transfer
       - mag_calibration_status
+      - manual_control
       - mocap_pose_estimate
       - mount_control
       - nav_controller_output
@@ -35,11 +48,14 @@
       - px4flow
       - rallypoint
       - rangefinder
+      - rc_io
+      - tdr_radio
       - terrain
       - trajectory
       - tunnel
       - vfr_hud
       - vibration
-      - vision_speed_estimate
+      - vision_pose
+      - vision_speed
       - wheel_odometry
       - wind_estimation
