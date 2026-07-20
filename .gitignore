@@ -9,3 +9,4 @@ __pycache__/
 install_716.zip
 tool/mask/.venv_build/
 *_716.zip
+.vscode/
