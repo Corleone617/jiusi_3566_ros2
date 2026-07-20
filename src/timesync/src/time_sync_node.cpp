@@ -36,11 +36,15 @@ class TimeSyncNode : public rclcpp::Node
 {
 public:
   TimeSyncNode()
-  : Node("mavros_time_sync"),
+    : Node("mavros_time_sync"),
     state_(State::INIT),
     synced_(false),
     gps_lost_count_(0)
   {
+    // 启动时清零内核时钟纪律状态：旧版 apply_slew 误用 STA_PLL 会在内核累积频率误差，
+    // 且该状态是系统级全局的、跨进程重启不消失。必须显式清零，否则重启 timesync 仍带病运行。
+    reset_kernel_clock_discipline();
+
     // ---- 参数声明 ----
     declare_parameter("window_size", 300);           // 滑动窗口样本数
     declare_parameter("bootstrap_threshold_ms", 500.0); // bootstrap 触发阈值 (ms)
@@ -257,6 +261,10 @@ private:
       return false;
     }
 
+    // 硬跳后清零内核频率纪律状态：clock_settime 只重置相位，
+    // 内核累积的频率误差（若有）会立即把时钟再次拉偏。必须一并清零。
+    reset_kernel_clock_discipline();
+
     // 硬跳后清除窗口旧数据（旧 offset 已无意义）
     {
       std::lock_guard<std::mutex> lock(window_mutex_);
@@ -269,13 +277,17 @@ private:
     return true;
   }
 
-  // 微调：用 adjtimex(STA_PLL) 渐进式频率调整
-  // 每次最多调整 ±100ms，通过修改内核时钟频率（~500ppm）平滑过渡
+  // 微调：用 ADJ_OFFSET_SINGLESHOT 渐进式 slew（单次渐进调整）
+  // 重要：绝不使用 STA_PLL/ADJ_OFFSET 的内核 PLL 频率纪律——
+  //   旧版用 STA_PLL 每秒喂 offset，内核 PLL 会持续积分频率估计，
+  //   ~5 分钟后频率 windup 导致控制环发散（offset 从 0 冲到 -500ms+，触发 re-bootstrap 死循环）。
+  //   ADJ_OFFSET_SINGLESHOT 是单次 slew，不激活 PLL、不积分频率，根除 windup。
+  //   内核默认以 ~500ppm 速率渐进消化 offset，配合每秒测量+重喂可稳定跟踪。
+  //   平台无关的标准 Linux API，RK3566/3588 ARM64 同样适用。
   void apply_slew(double offset_ms)
   {
     struct timex tx = {};
-    tx.modes = ADJ_OFFSET | ADJ_STATUS;
-    tx.status = STA_PLL;                              // PLL 锁相环模式
+    tx.modes = ADJ_OFFSET_SINGLESHOT;                 // 单次渐进 slew（无 PLL 频率纪律）
 
     long offset_us = static_cast<long>(offset_ms * 1000.0);
     long max_step_us = 100000;                        // 每次最多 ±100ms
@@ -286,6 +298,20 @@ private:
 
     if (adjtimex(&tx) < 0)
       RCLCPP_ERROR(get_logger(), "adjtimex failed: %s", strerror(errno));
+  }
+
+  // 清零内核时钟纪律状态：清除 STA_PLL 等纪律位 + 频率校正归零
+  // 用于启动时清理旧代码遗留的内核 windup，以及每次 bootstrap 后防止残余频率误差
+  // 把时钟再次拉偏（clock_settime 只重置相位，不清频率）
+  void reset_kernel_clock_discipline()
+  {
+    struct timex tx = {};
+    tx.modes = ADJ_STATUS | ADJ_FREQUENCY;
+    tx.status = 0;                                    // 清除所有纪律位（STA_PLL/STA_FLL/STA_UNSYNC 等）
+    tx.freq = 0;                                      // 频率校正归零
+    if (adjtimex(&tx) < 0) {
+      RCLCPP_WARN(get_logger(), "reset_kernel_clock_discipline failed: %s", strerror(errno));
+    }
   }
 
   // 监控回调：10Hz，检查 GPS 超时 + 定期打印同步精度

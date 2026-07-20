@@ -13,6 +13,7 @@
 
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <yaml-cpp/yaml.h>
 
@@ -84,6 +85,8 @@ int64_t disk_free_mb(const std::string & path)
 }
 
 // 递归删除目录（含子目录和所有文件）
+// 注意：使用 lstat 而非 stat，遇到符号链接只删除链接本身，绝不跟随递归
+//       （防止 evil symlink 指向 / 等系统目录被递归清空）
 void remove_dir(const std::string & path)
 {
   DIR * d = opendir(path.c_str());
@@ -97,12 +100,19 @@ void remove_dir(const std::string & path)
     if (entry->d_name[0] == '.') continue;
     std::string full = path + "/" + entry->d_name;
     struct stat st;
-    if (stat(full.c_str(), &st) == 0) {
-      if (S_ISDIR(st.st_mode)) remove_dir(full); else {
-        if (std::remove(full.c_str()) != 0) {
-          fprintf(stderr, "[bag_logd] remove_dir: remove(%s) failed: %s\n",
-                  full.c_str(), strerror(errno));
-        }
+    if (lstat(full.c_str(), &st) != 0) continue;       // lstat 不跟随符号链接
+    if (S_ISLNK(st.st_mode)) {
+      // 符号链接：只删除链接本身，绝不递归进入其目标
+      if (unlink(full.c_str()) != 0) {
+        fprintf(stderr, "[bag_logd] remove_dir: unlink symlink(%s) failed: %s\n",
+                full.c_str(), strerror(errno));
+      }
+    } else if (S_ISDIR(st.st_mode)) {
+      remove_dir(full);
+    } else {
+      if (std::remove(full.c_str()) != 0) {
+        fprintf(stderr, "[bag_logd] remove_dir: remove(%s) failed: %s\n",
+                full.c_str(), strerror(errno));
       }
     }
   }
@@ -111,6 +121,53 @@ void remove_dir(const std::string & path)
     fprintf(stderr, "[bag_logd] remove_dir: rmdir(%s) failed: %s\n",
             path.c_str(), strerror(errno));
   }
+}
+
+// 校验 storage_path 安全性：防止递归删除误伤系统目录或被路径穿越攻击
+// 规则：绝对路径、不含 ".." 分量、不在系统目录黑名单、至少 2 级路径分量
+// 成功时把 path 规范化（去多余/尾部斜杠），失败时 reason 填充原因
+bool validate_storage_path(std::string & path, std::string & reason)
+{
+  if (path.empty()) { reason = "storage_path is empty"; return false; }
+  if (path[0] != '/') { reason = "storage_path must be absolute: " + path; return false; }
+
+  // 拆分并规范化路径分量，拒绝 ".."
+  std::vector<std::string> parts;
+  std::string seg;
+  for (size_t i = 0; i <= path.size(); ++i) {
+    if (i == path.size() || path[i] == '/') {
+      if (!seg.empty() && seg != ".") {
+        if (seg == "..") { reason = "storage_path must not contain '..': " + path; return false; }
+        parts.push_back(seg);
+      }
+      seg.clear();
+    } else {
+      seg += path[i];
+    }
+  }
+
+  if (parts.empty()) { reason = "storage_path is root '/'"; return false; }
+  if (parts.size() < 2) { reason = "storage_path too shallow (need at least /x/y): " + path; return false; }
+
+  // 重建规范化路径
+  std::string normalized;
+  for (const auto & p : parts) normalized += "/" + p;
+
+  // 系统目录黑名单（一级系统目录禁止作为存储根）
+  static const std::vector<std::string> denylist = {
+    "/", "/data", "/home", "/etc", "/usr", "/var", "/tmp", "/boot",
+    "/root", "/opt", "/bin", "/sbin", "/lib", "/lib64", "/proc",
+    "/sys", "/dev", "/run", "/media", "/mnt", "/srv"
+  };
+  for (const auto & bad : denylist) {
+    if (normalized == bad) {
+      reason = "storage_path refuses system directory: " + normalized;
+      return false;
+    }
+  }
+
+  path = normalized;
+  return true;
 }
 
 // 从 YAML 文件加载配置
@@ -131,9 +188,12 @@ Config load_config(const std::string & config_file)
       cfg.disk_check_interval_sec = root["disk_check_interval_sec"].as<int>();
 
     // 合法性校验
-    if (cfg.storage_path.empty()) {
-      fprintf(stderr, "[bag_logd] FATAL: storage_path is empty\n");
-      throw std::runtime_error("storage_path is empty");
+    {
+      std::string reason;
+      if (!validate_storage_path(cfg.storage_path, reason)) {
+        fprintf(stderr, "[bag_logd] FATAL: %s\n", reason.c_str());
+        throw std::runtime_error(reason);
+      }
     }
     if (cfg.min_recording_free_space_mb < 0) {
       fprintf(stderr, "[bag_logd] WARN: min_recording_free_space_mb is negative, using 0\n");
@@ -220,9 +280,13 @@ public:
         start_rotation_timer();
       } catch (const std::exception & e) {
         RCLCPP_ERROR(get_logger(), "Failed to open bag at startup: %s", e.what());
-        std::lock_guard<std::mutex> lock(writer_mutex_);
-        writer_.reset();
+        {
+          std::lock_guard<std::mutex> lock(writer_mutex_);
+          writer_.reset();
+          current_bag_path_.clear();
+        }
         recording_ = false;
+        schedule_retry();                             // 5s 周期重试恢复录制
       }
     }
 
@@ -239,6 +303,7 @@ public:
   {
     disk_check_timer_->cancel();
     if (rotation_timer_) rotation_timer_->cancel();
+    if (retry_timer_) retry_timer_->cancel();
     std::lock_guard<std::mutex> lock(writer_mutex_);
     if (writer_) {
       try { writer_->close(); } catch (...) {}
@@ -334,7 +399,7 @@ private:
     rosbag2_storage::StorageOptions opts;
     opts.uri = current_bag_path_;
     opts.storage_id = "sqlite3";
-    opts.max_cache_size = 8 * 1024 * 1024;   // 8MB 写缓存，平衡内存和吞吐
+    opts.max_cache_size = 64 * 1024 * 1024;  // 64MB 写缓存，吸收 IMU@400Hz + 点云的 I/O 突发
     // 注意：不再传入 max_bagfile_duration/max_bagfile_size
     // 内部分片由 rotation_timer 替代，每个切片是独立目录
     writer_->open(opts);
@@ -400,7 +465,58 @@ private:
       RCLCPP_ERROR(get_logger(),
         "Failed to open bag after rotation — data gap for this slice: %s", e.what());
       writer_.reset();
+      current_bag_path_.clear();
       recording_ = false;
+      schedule_retry();                               // 5s 周期重试恢复录制
+    }
+  }
+
+  // 安排录制重试：open_new_bag 失败后周期性重试（5s 间隔）
+  // 由 retry_open_bag 判断是否真正重开（磁盘不足/未武装时自动顺延）
+  void schedule_retry()
+  {
+    if (retry_timer_) return;                          // 已在重试中
+    retry_timer_ = create_wall_timer(
+      std::chrono::seconds(5),
+      std::bind(&BagRecorderNode::retry_open_bag, this));
+    RCLCPP_WARN(get_logger(), "Recording retry scheduled (5s interval)");
+  }
+
+  // 重试打开新 bag：成功则恢复录制，失败则继续等待下次重试
+  void retry_open_bag()
+  {
+    if (recording_) {                                  // 已恢复录制
+      if (retry_timer_) { retry_timer_->cancel(); retry_timer_.reset(); }
+      return;
+    }
+    // 武装触发模式下未解锁，不应录制（等下一次 ARM 触发）
+    if (cfg_.arm_record_enabled && !armed_) {
+      if (retry_timer_) { retry_timer_->cancel(); retry_timer_.reset(); }
+      return;
+    }
+    // 磁盘空间不足时暂不重试（H5 停录后等空间恢复）
+    int64_t free_mb = disk_free_mb(cfg_.storage_path);
+    if (free_mb >= 0 && free_mb < cfg_.min_recording_free_space_mb) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+        "Retry deferred: disk still low (%ld MB < %d MB)",
+        free_mb, cfg_.min_recording_free_space_mb);
+      return;
+    }
+    try {
+      std::lock_guard<std::mutex> lock(writer_mutex_);
+      open_new_bag();
+      recording_ = true;
+      RCLCPP_INFO(get_logger(), "Recording recovered after retry: %s",
+        current_bag_path_.c_str());
+      start_rotation_timer();
+      if (retry_timer_) { retry_timer_->cancel(); retry_timer_.reset(); }
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Retry open_new_bag failed: %s", e.what());
+      std::lock_guard<std::mutex> lock(writer_mutex_);
+      writer_.reset();
+      current_bag_path_.clear();
+      // 保留 retry_timer_ 继续重试
     }
   }
 
@@ -431,8 +547,10 @@ private:
       } catch (const std::exception & e) {
         RCLCPP_ERROR(get_logger(), "Failed to open bag on ARM: %s", e.what());
         writer_.reset();
+        current_bag_path_.clear();
         recording_ = false;
         armed_ = false;                              // 失败回退
+        schedule_retry();                           // 武装模式下由下一条 state 消息触发恢复
       }
     } else {
       // ---- 上锁 ----
@@ -478,7 +596,14 @@ private:
         std::string full = cfg_.storage_path + "/" + entry->d_name;
         if (full == current_bag_path_) continue;      // 保护活跃切片
         struct stat st;
-        if (stat(full.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (lstat(full.c_str(), &st) != 0) continue;  // lstat 不跟随符号链接
+        if (S_ISLNK(st.st_mode)) {
+          // 存储目录里不应有符号链接，删除链接本身并告警（不跟随，不加入待删列表）
+          RCLCPP_WARN(get_logger(), "  Removing stray symlink in storage: %s", entry->d_name);
+          unlink(full.c_str());
+          continue;
+        }
+        if (!S_ISDIR(st.st_mode)) continue;
         dirs.push_back(entry->d_name);
       }
       closedir(d);
@@ -506,6 +631,18 @@ private:
     if (free_mb >= 0) {
       RCLCPP_INFO(get_logger(), "  After cleanup: free=%ld MB", free_mb);
     }
+
+    // 清理后仍不达标：紧急停止录制，避免写满磁盘拖垮系统其它组件
+    // 空间恢复后由 retry_timer（retry_open_bag）自动恢复录制
+    if (free_mb >= 0 && free_mb < cfg_.min_recording_free_space_mb) {
+      RCLCPP_ERROR(get_logger(),
+        "DISK FULL after cleanup (%ld MB < %d MB) — stopping recording to protect system",
+        free_mb, cfg_.min_recording_free_space_mb);
+      recording_ = false;
+      stop_rotation_timer();
+      close_writer();
+      schedule_retry();
+    }
   }
 
   // 解锁时清理所有旧的 bag 目录（为本次飞行腾出空间）
@@ -527,7 +664,14 @@ private:
       std::string full = cfg_.storage_path + "/" + entry->d_name;
       if (full == current_bag_path_) continue;        // 保护活跃切片
       struct stat st;
-      if (stat(full.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+      if (lstat(full.c_str(), &st) != 0) continue;    // lstat 不跟随符号链接
+      if (S_ISLNK(st.st_mode)) {
+        // 存储目录里不应有符号链接，删除链接本身并告警（绝不跟随）
+        RCLCPP_WARN(get_logger(), "  Removing stray symlink in storage: %s", entry->d_name);
+        unlink(full.c_str());
+        continue;
+      }
+      if (!S_ISDIR(st.st_mode)) continue;             // 非目录（普通文件等）跳过
       RCLCPP_INFO(get_logger(), "  Remove old bag: %s", entry->d_name);
       remove_dir(full);
     }
@@ -548,6 +692,7 @@ private:
   rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr arm_state_sub_;
   rclcpp::TimerBase::SharedPtr disk_check_timer_;   // 磁盘检查定时器
   rclcpp::TimerBase::SharedPtr rotation_timer_;     // 切片旋转定时器
+  rclcpp::TimerBase::SharedPtr retry_timer_;        // 录制失败重试定时器
 };
 
 int main(int argc, char ** argv)
@@ -590,7 +735,15 @@ int main(int argc, char ** argv)
     return 1;
   }
 
-  if (!storage_override.empty()) cfg.storage_path = storage_override;
+  if (!storage_override.empty()) {
+    cfg.storage_path = storage_override;
+    std::string reason;
+    if (!validate_storage_path(cfg.storage_path, reason)) {
+      fprintf(stderr, "[bag_logd] FATAL: %s\n", reason.c_str());
+      rclcpp::shutdown();
+      return 1;
+    }
+  }
 
   RCLCPP_INFO(rclcpp::get_logger("bag_logd"), "Config loaded from: %s",
     config_path.c_str());

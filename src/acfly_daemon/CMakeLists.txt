@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 find_library(YAML_CPP_LIB yaml-cpp)
@@ -25,7 +26,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 add_executable(acfly_daemon_node src/acfly_daemon_node.cpp)
 target_compile_features(acfly_daemon_node PUBLIC cxx_std_17)
-ament_target_dependencies(acfly_daemon_node rclcpp std_msgs std_srvs)
+ament_target_dependencies(acfly_daemon_node rclcpp std_msgs std_srvs nav_msgs)
 rosidl_target_interfaces(acfly_daemon_node
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(acfly_daemon_node ${YAML_CPP_LIB})

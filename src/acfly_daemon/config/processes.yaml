@@ -4,6 +4,9 @@ supervisor:
   graceful_shutdown_timeout_sec: 10.0
   initial_backoff_sec: 1.0
   max_backoff_sec: 60.0
+  # 进程连续正常运行超过该秒数后，重置崩溃退避到 initial_backoff_sec
+  # 避免“早期反复崩溃→退避变大→长期正常后再次崩溃重启过慢”
+  min_uptime_reset_sec: 30.0
   topic_check_interval_sec: 2.0
 
 processes:

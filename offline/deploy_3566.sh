@@ -1,4 +1,4 @@
-#/bin/bash
+#!/bin/bash
 #
 # AcFly 部署脚本 — 离线优先，在线兜底
 # 用法:  cd install/offline && ./deploy.sh
@@ -195,6 +195,19 @@ if [ -f "$TIMESYNC_BIN" ]; then
 else
     echo "  ! timesync 二进制未找到: $TIMESYNC_BIN"
 fi
+
+# --- 禁用系统 NTP 服务，避免和 timesync 抢时钟 ---
+# timesync 节点用 GPS 时间驯服 CLOCK_REALTIME；chronyd / systemd-timesyncd 若同时运行
+# 会用互联网 NTP 或本地频率估计反向纠正时钟，与 timesync 形成反馈环，
+# 导致 offset 反复发散、re-bootstrap 死循环（已实测：chrony 活跃时 ~5 分钟必发散）。
+# 生产板无网络，本就不需要系统 NTP。此处幂等，未安装也不会报错。
+echo "  禁用系统时间服务（避免与 timesync 冲突）..."
+sudo systemctl disable --now chronyd 2>/dev/null && echo "  chronyd 已停用并禁用 ✓" || echo "  chronyd 未安装或已禁用"
+sudo systemctl disable --now systemd-timesyncd 2>/dev/null && echo "  systemd-timesyncd 已停用并禁用 ✓" || echo "  systemd-timesyncd 未安装或已禁用"
+sudo systemctl disable --now ntpd 2>/dev/null && echo "  ntpd 已停用并禁用 ✓" || echo "  ntpd 未安装或已禁用"
+sudo systemctl mask chronyd 2>/dev/null || true      # mask 防止被其它服务间接拉起
+sudo systemctl mask systemd-timesyncd 2>/dev/null || true
+sudo systemctl mask ntpd 2>/dev/null || true
 
 sudo mkdir -p /data/bags /tmp/acfly_logs
 sudo chown -R "$REAL_USER:$REAL_USER" /data/bags /tmp/acfly_logs

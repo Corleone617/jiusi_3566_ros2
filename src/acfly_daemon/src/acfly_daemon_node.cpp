@@ -8,7 +8,9 @@
 // 提供服务：~/start ~/stop ~/restart ~/shutdown ~/get_status
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
@@ -21,6 +23,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_srvs/srv/trigger.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "yaml-cpp/yaml.h"
 
 #include "acfly_daemon/msg/process_status.hpp"
@@ -139,6 +142,22 @@ public:
 
     health_check_hz_ = declare_parameter("health_check_hz", 2.0);
 
+    // ---- odin1_driver 数据面健康检查参数（专用）----
+    // 订阅 odin1 里程计，停流超过阈值判定 SDK 假死（USB 接触不良/SDK 卡死），
+    // 直接 SIGKILL 让崩溃重启路径拉起。连续失败达上限则放弃，避免无限 thrash。
+    odin_health_topic_ = declare_parameter("odin_health_topic", std::string("/odin1/odometry_highfreq"));
+    odin_health_timeout_sec_ = declare_parameter("odin_health_timeout_sec", 5.0);
+    odin_health_max_fails_ = declare_parameter("odin_health_max_fails", 5);
+    odin_health_reset_uptime_sec_ = declare_parameter("odin_health_reset_uptime_sec", 60.0);
+
+    odin_health_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      odin_health_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&AcflyDaemon::odin_health_cb, this, std::placeholders::_1));
+    RCLCPP_INFO(get_logger(),
+      "odin1_driver health check: topic=%s timeout=%.1fs max_fails=%d reset_uptime=%.0fs",
+      odin_health_topic_.c_str(), odin_health_timeout_sec_, odin_health_max_fails_,
+      odin_health_reset_uptime_sec_);
+
     start_time_ = now();
 
     // 主健康检查定时器：2Hz 频率驱动状态机
@@ -177,6 +196,7 @@ private:
       graceful_shutdown_timeout_ = sup["graceful_shutdown_timeout_sec"].as<double>(10.0);
       initial_backoff_sec_ = sup["initial_backoff_sec"].as<double>(1.0);
       max_backoff_sec_ = sup["max_backoff_sec"].as<double>(60.0);
+      min_uptime_reset_sec_ = sup["min_uptime_reset_sec"].as<double>(30.0);
     }
 
     // 确保日志目录存在
@@ -277,15 +297,52 @@ private:
 
   // fork + exec 启动子进程
   // 杀灭同名僵尸进程：防止上次崩溃残留占据 USB/串口等独占资源
+  // 直接遍历 /proc 按 cmdline 子串匹配后用 kill(pid,SIGKILL) 终止，
+  // 不经过 shell，杜绝配置参数被注入为 shell 命令的风险
   void kill_zombie(const ManagedProcess & mp)
   {
     if (mp.args.empty()) return;
-    std::string pattern = mp.args.back();              // 最后一个 arg 作唯一标识
-    std::string cmd = "pkill -9 -f '" + pattern + "' 2>/dev/null";
-    if (std::system(cmd.c_str()) == 0) {
-      RCLCPP_WARN(get_logger(), "Killed zombie %s before start (pattern: %s)",
-        mp.name.c_str(), pattern.c_str());
+    const std::string & pattern = mp.args.back();      // 最后一个 arg 作唯一标识
+    const pid_t self_pid = getpid();
+
+    DIR * d = opendir("/proc");
+    if (!d) return;
+    struct dirent * entry;
+    while ((entry = readdir(d)) != nullptr) {
+      // 只处理纯数字目录名（即 PID）
+      if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+      pid_t pid = static_cast<pid_t>(std::atoi(entry->d_name));
+      if (pid <= 0 || pid == self_pid) continue;
+
+      // 保护当前已管理的子进程，避免误杀正管理的实例
+      bool is_managed = false;
+      for (const auto & m : processes_) {
+        if (m.pid == pid) { is_managed = true; break; }
+      }
+      if (is_managed) continue;
+
+      // 读取 /proc/<pid>/cmdline（以 \0 分隔的 argv）
+      std::string cmdline_path = "/proc/" + std::string(entry->d_name) + "/cmdline";
+      int fd = open(cmdline_path.c_str(), O_RDONLY);
+      if (fd < 0) continue;
+      std::string cmdline;
+      char buf[4096];
+      ssize_t n;
+      while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        cmdline.append(buf, static_cast<size_t>(n));
+      }
+      close(fd);
+      if (cmdline.empty()) continue;                    // 内核线程无 cmdline
+
+      // 子串匹配（等价 pkill -f 语义，但无 shell 注入风险）
+      if (cmdline.find(pattern) != std::string::npos) {
+        if (kill(pid, SIGKILL) == 0) {
+          RCLCPP_WARN(get_logger(), "Killed zombie pid=%d before start %s (pattern: %s)",
+            pid, mp.name.c_str(), pattern.c_str());
+        }
+      }
     }
+    closedir(d);
   }
 
   void start_process(ManagedProcess & mp)
@@ -334,6 +391,13 @@ private:
     mp.start_time = now();
     mp.exit_code = 0;
     mp.exit_reason.clear();
+
+    // odin1_driver（重新）启动：重置健康检查武装态，等新实例产出首条里程计再武装
+    // 注意：不重置 odin_health_fail_count_，让崩溃重启路径的失败计数继续累积（防 thrash）
+    if (mp.name == "odin1_driver") {
+      odin_health_armed_ = false;
+      odin_running_steady_ = std::chrono::steady_clock::now();
+    }
 
     RCLCPP_INFO(get_logger(), "Started %s (pid=%d)", mp.name.c_str(), pid);
   }
@@ -459,6 +523,81 @@ private:
           mp.name.c_str(), mp.pid);
       }
     }
+
+    // 成功运行超过 min_uptime_reset_sec_ 后重置退避时间
+    // 避免进程长期正常运行后仍带着历史崩溃累积的大退避，导致下次崩溃重启过慢
+    auto now_t = now();
+    for (auto & mp : processes_) {
+      if (mp.state != ProcessState::RUNNING) continue;
+      if (mp.current_backoff_sec <= initial_backoff_sec_) continue;
+      if ((now_t - mp.start_time).seconds() >= min_uptime_reset_sec_) {
+        mp.current_backoff_sec = initial_backoff_sec_;
+      }
+    }
+  }
+
+  // odin1 里程计心跳回调：收到数据即武装，并刷新最近消息时间
+  // 用 steady_clock（单调时钟）而非 ROS 时间——timesync 会 clock_settime 跳变
+  // CLOCK_REALTIME，用 ROS 时间测超时会因时钟跳变给出错误结果
+  void odin_health_cb(const nav_msgs::msg::Odometry::SharedPtr)
+  {
+    odin_last_msg_steady_ = std::chrono::steady_clock::now();
+    odin_health_armed_ = true;                        // 收到首条里程计即武装
+  }
+
+  // odin1_driver 数据面健康检查：RUNNING 且武装后，若里程计停流超过阈值 → SIGKILL
+  // 由 reap_children 判为崩溃 → 现有指数退避重启路径拉起
+  // 连续失败达上限则放弃自动重启（防 thrash），置 STOPPED + 告警，等人工介入
+  void check_odin_health()
+  {
+    auto * mp = find_process("odin1_driver");
+    if (!mp) return;
+    if (mp->state != ProcessState::RUNNING) return;   // 仅 RUNNING 时检查
+    if (!odin_health_armed_) return;                  // 尚未收到首条里程计（启动初始化期），跳过
+    if (mp->pid <= 0) return;
+
+    auto now_steady = std::chrono::steady_clock::now();
+    double stall_sec = std::chrono::duration<double>(now_steady - odin_last_msg_steady_).count();
+
+    if (stall_sec <= odin_health_timeout_sec_) {
+      // 数据正常：持续健康超过阈值则复位失败计数（避免长时段偶发停滞累积到上限永久放弃）
+      if (odin_health_fail_count_ > 0) {
+        double healthy_uptime =
+          std::chrono::duration<double>(now_steady - odin_running_steady_).count();
+        if (healthy_uptime >= odin_health_reset_uptime_sec_) {
+          RCLCPP_INFO(get_logger(),
+            "odin1_driver healthy for %.0fs, resetting health fail count (%d -> 0)",
+            healthy_uptime, odin_health_fail_count_);
+          odin_health_fail_count_ = 0;
+        }
+      }
+      return;
+    }
+
+    // ---- 里程计停流超时，判定 odin1 SDK 假死 ----
+    if (odin_health_fail_count_ >= odin_health_max_fails_) {
+      // 连续失败达上限：停止自动重启，告警，等人工介入（多为 USB/线缆硬件问题）
+      RCLCPP_ERROR(get_logger(),
+        "odin1_driver data stall %.1fs (no '%s'), %d consecutive fails >= limit %d. "
+        "GIVING UP auto-restart — likely hardware (USB/cable). MANUAL INTERVENTION REQUIRED.",
+        stall_sec, odin_health_topic_.c_str(),
+        odin_health_fail_count_, odin_health_max_fails_);
+      mp->auto_restart = false;                       // 阻止 handle_restarts 再次重启
+      mp->stopping = true;                            // 让 reap_children 判为 STOPPED 而非 RESTARTING
+      mp->exit_reason = "health_check_giveup:data_stall";
+      kill(mp->pid, SIGKILL);
+      odin_health_armed_ = false;                     // 避免下轮重复触发
+      return;
+    }
+
+    odin_health_fail_count_++;
+    RCLCPP_ERROR(get_logger(),
+      "odin1_driver data stall %.1fs (no '%s') — SIGKILL + auto-restart (health fail %d/%d)",
+      stall_sec, odin_health_topic_.c_str(),
+      odin_health_fail_count_, odin_health_max_fails_);
+    kill(mp->pid, SIGKILL);                           // 卡死的 SDK 不响应 SIGINT，直接 SIGKILL
+    odin_health_armed_ = false;                       // 重启后由新首条里程计重新武装
+    // stopping 保持 false → reap_children 下一轮判 RUNNING→RESTARTING → handle_restarts 退避重启
   }
 
   // 启动就绪的 PENDING 进程：依赖满足 + 话题就绪
@@ -488,12 +627,14 @@ private:
     // 1. 回收僵尸进程
     // 2. 检查停止超时
     // 3. 确认已启动进程
-    // 4. 处理崩溃重启
-    // 5. 启动就绪进程
-    // 6. 发布状态
+    // 4. odin1 数据面健康检查（里程计停流检测）
+    // 5. 处理崩溃重启
+    // 6. 启动就绪进程
+    // 7. 发布状态
     reap_children();
     check_stop_timeouts();
     check_started();
+    check_odin_health();
     handle_restarts();
     handle_pending();
     publish_status();
@@ -613,6 +754,11 @@ private:
     }
     mp->state = ProcessState::PENDING;
     mp->current_backoff_sec = initial_backoff_sec_;  // 重置退避
+    // 手动启动视为人工介入：清除 odin1 健康检查的 give-up 状态与失败计数
+    if (req->name == "odin1_driver") {
+      odin_health_fail_count_ = 0;
+      mp->auto_restart = true;
+    }
     start_process(*mp);                               // 直接启动（不等定时器）
     resp->success = mp->state == ProcessState::STARTING;
     resp->message = resp->success ? req->name + " starting" : "Failed to start " + req->name;
@@ -624,6 +770,7 @@ private:
   {
     if (req->name.empty()) {
       shutdown_all();
+      shutting_down_ = false;                          // 仅停全部子进程，daemon 仍存活
       resp->success = true;
       resp->message = "All processes shutting down";
       return;
@@ -650,10 +797,14 @@ private:
   {
     if (req->name.empty()) {
       shutdown_all();
+      shutting_down_ = false;                          // 重启流程，daemon 仍存活
       for (auto & mp : processes_) {
         mp.state = ProcessState::PENDING;
         mp.current_backoff_sec = initial_backoff_sec_;
       }
+      // 重启全部视为人工介入：清除 odin1 健康检查的 give-up 状态与失败计数
+      odin_health_fail_count_ = 0;
+      if (auto * odin = find_process("odin1_driver")) odin->auto_restart = true;
       resp->success = true;
       resp->message = "All processes restarting";
       return;
@@ -675,6 +826,11 @@ private:
     }
     mp->state = ProcessState::PENDING;
     mp->current_backoff_sec = initial_backoff_sec_;
+    // 手动重启视为人工介入：清除 odin1 健康检查的 give-up 状态与失败计数
+    if (req->name == "odin1_driver") {
+      odin_health_fail_count_ = 0;
+      mp->auto_restart = true;
+    }
     start_process(*mp);
     resp->success = mp->state == ProcessState::STARTING;
     resp->message = resp->success ? req->name + " restarting" : "Failed to restart " + req->name;
@@ -751,6 +907,7 @@ private:
   double graceful_shutdown_timeout_ = 10.0;          // 全局关闭超时 (s)
   double initial_backoff_sec_ = 1.0;                 // 初始退避时间
   double max_backoff_sec_ = 60.0;                    // 最大退避时间
+  double min_uptime_reset_sec_ = 30.0;               // 成功运行多久后重置退避
   double health_check_hz_ = 2.0;                     // 健康检查频率
   bool shutting_down_ = false;                        // 是否正在关闭中
   rclcpp::Time start_time_;
@@ -763,11 +920,38 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr shutdown_srv_;
   rclcpp::Service<ad::srv::GetProcessStatus>::SharedPtr get_status_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
+
+  // ---- odin1_driver 数据面健康检查（专用）----
+  std::string odin_health_topic_;                     // 监控的里程计话题
+  double odin_health_timeout_sec_ = 5.0;              // 停流超时阈值
+  int odin_health_max_fails_ = 5;                     // 连续失败放弃上限
+  double odin_health_reset_uptime_sec_ = 60.0;        // 持续健康多久后复位失败计数
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odin_health_sub_;
+  std::chrono::steady_clock::time_point odin_last_msg_steady_;  // 最近一条里程计时间
+  std::chrono::steady_clock::time_point odin_running_steady_;   // 本次启动时刻（用于健康复位计时）
+  bool odin_health_armed_ = false;                    // 是否已武装（收到首条里程计后）
+  int odin_health_fail_count_ = 0;                    // 连续健康失败重启计数
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
+
+  // 把 daemon 自身的 stdout/stderr 也重定向到 /tmp/acfly_logs/acfly_daemon.log
+  // （与子进程日志同目录、同 O_APPEND 方式）。构造函数里的 truncate_old_logs()
+  // 会先清空该文件，保证每次启动是一个新会话。代价：ros2 launch 的 output="screen"
+  // 不再在终端显示 daemon 输出，统一用 tail /tmp/acfly_logs/acfly_daemon.log 查看。
+  {
+    const char * daemon_log_dir = "/tmp/acfly_logs";
+    mkdir(daemon_log_dir, 0755);                       // 确保目录存在（已存在不报错）
+    std::string daemon_log = std::string(daemon_log_dir) + "/acfly_daemon.log";
+    int fd = open(daemon_log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+      dup2(fd, STDOUT_FILENO);
+      dup2(fd, STDERR_FILENO);
+      close(fd);
+    }
+  }
 
   // 安装信号处理器（SIGINT/SIGTERM → 标记 -> on_timer 中优雅关闭）
   struct sigaction sa {};
