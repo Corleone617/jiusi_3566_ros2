@@ -73,12 +73,17 @@ topics:
     qos: "sensor_data"
     depth: 100
 
-  - name: "/mavros/imu/data"
-    type: "sensor_msgs/msg/Imu"
-    qos: "sensor_data"
-    depth: 4000
-
-  - name: "/mavros/local_position/pose"
-    type: "geometry_msgs/msg/PoseStamped"
+  - name: "/mavros/gpsstatus/gps2/raw"
+    type: "mavros_msgs/msg/GPSRAW"
     qos: "sensor_data"
     depth: 100
+
+  # - name: "/mavros/imu/data"
+  #   type: "sensor_msgs/msg/Imu"
+  #   qos: "sensor_data"
+  #   depth: 4000
+
+  # - name: "/mavros/local_position/pose"
+  #   type: "geometry_msgs/msg/PoseStamped"
+  #   qos: "sensor_data"
+  #   depth: 100
