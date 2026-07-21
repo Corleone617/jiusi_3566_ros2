@@ -16,13 +16,12 @@
 /**/mavros_router:
   ros__parameters:
     uas_msg_denylist:
-      # 仅保留: GPS(24,124) + 姿态(30,31) + 状态(0,1,148) + IMU(105) + TIMESYNC(266)
+      # 仅保留: GPS(24,124) + 全局位置(33) + 姿态(30,31) + 状态(0,1,148) + IMU(105) + TIMESYNC(266)
       # 30/31=ATTITUDE/QUATERNION 为 IMU 插件提供融合姿态 → /mavros/imu/data
       # 105=acfly_odometry 5s对齐, 266=timesync时钟同步
       - 26   # SCALED_IMU
       - 27   # RAW_IMU
       - 29   # SCALED_PRESSURE
-      - 33   # GLOBAL_POSITION_INT
       - 36   # SERVO_OUTPUT_RAW
       - 62   # NAV_CONTROLLER_OUTPUT
       - 65   # RC_CHANNELS
