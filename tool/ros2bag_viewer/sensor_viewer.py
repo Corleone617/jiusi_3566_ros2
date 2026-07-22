@@ -33,6 +33,8 @@ import sys
 import os
 import io
 import json
+import glob
+import sqlite3
 import numpy as np
 from datetime import datetime
 from PIL import Image
@@ -60,14 +62,24 @@ except ImportError as e:
     HAS_ROSBAG2 = False
     ROSBAG_ERR = str(e)
 
+# GPS (mavros_msgs/GPSRAW) is optional: if mavros_msgs is unavailable, the
+# viewer still works for IMU/Pose/Image and simply hides the GPS option.
+try:
+    from mavros_msgs.msg import GPSRAW
+    HAS_GPSRAW = True
+    GPSRAW_ERR = ''
+except ImportError as e:
+    HAS_GPSRAW = False
+    GPSRAW_ERR = str(e)
+
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QCheckBox, QPushButton, QFileDialog, QStatusBar,
     QLabel, QSplitter, QMessageBox, QComboBox, QFrame, QSlider,
-    QInputDialog, QAction
+    QInputDialog, QAction, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QTimer, QSize
+from PyQt5.QtGui import QFont, QIcon
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -76,6 +88,18 @@ from matplotlib.figure import Figure
 import matplotlib
 matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+# Larger, bolder fonts for readability
+matplotlib.rcParams.update({
+    'font.size': 12,
+    'axes.labelsize': 13,
+    'axes.titlesize': 14,
+    'axes.titleweight': 'bold',
+    'axes.labelweight': 'bold',
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'legend.fontsize': 11,
+    'figure.titlesize': 14,
+})
 
 # ===========================================================================
 # Config
@@ -112,12 +136,15 @@ def save_config(cfg):
 DT_IMU   = 'IMU'
 DT_POSE  = 'Pose'
 DT_IMAGE = 'Image'
+DT_GPS   = 'GPS'
 
 TYPE_MAP = {
     'sensor_msgs/msg/Imu':              DT_IMU,
     'geometry_msgs/msg/PoseStamped':     DT_POSE,
     'sensor_msgs/msg/CompressedImage':   DT_IMAGE,
 }
+if HAS_GPSRAW:
+    TYPE_MAP['mavros_msgs/msg/GPSRAW'] = DT_GPS
 
 CHANNEL_GROUPS = {
     DT_IMU: [
@@ -127,6 +154,11 @@ CHANNEL_GROUPS = {
     DT_POSE: [
         ("Position (m)",       [("Pos X", "px"), ("Pos Y", "py"), ("Pos Z", "pz")]),
         ("Orientation (rad)",  [("Roll",  "roll"), ("Pitch", "pitch"), ("Yaw",  "yaw")]),
+    ],
+    DT_GPS: [
+        ("Position",            [("Lat (deg)", "lat"), ("Lon (deg)", "lon"), ("Alt (m)", "alt")]),
+        ("Heading (deg)",       [("Yaw", "yaw"), ("CoG", "cog")]),
+        ("Signal",              [("Satellites", "sat"), ("Fix Type", "fix")]),
     ],
 }
 
@@ -148,20 +180,14 @@ def quat_to_euler(qx, qy, qz, qw):
 # Loaders
 # ===========================================================================
 
-def scan_bag(bag_path):
-    reader = SequentialReader()
-    reader.open(StorageOptions(uri=bag_path, storage_id='sqlite3'),
-                ConverterOptions(input_serialization_format='cdr',
-                                 output_serialization_format='cdr'))
-    result = {}
-    for t in reader.get_all_topics_and_types():
-        dt = TYPE_MAP.get(t.type)
-        if dt:
-            result.setdefault(dt, []).append(t.name)
-    return result
+def _find_db3(bag_path):
+    files = sorted(glob.glob(os.path.join(bag_path, '*.db3')))
+    if not files:
+        files = sorted(glob.glob(os.path.join(bag_path, '*.mcap')))
+    return files[0] if files else None
 
 
-def _open_reader(bag_path):
+def _try_rosbag2_reader(bag_path):
     r = SequentialReader()
     r.open(StorageOptions(uri=bag_path, storage_id='sqlite3'),
            ConverterOptions(input_serialization_format='cdr',
@@ -169,8 +195,103 @@ def _open_reader(bag_path):
     return r
 
 
+class _SqliteBagReader:
+    """Fallback reader: streams messages directly from the .db3 SQLite file.
+
+    Used when metadata.yaml is missing/empty (e.g. recording was interrupted or
+    is still in progress) so rosbag2_py cannot open the bag. The `data` BLOB is
+    the raw CDR payload, identical to what rosbag2_py returns, so messages can be
+    decoded with rclpy.serialization.deserialize_message unchanged.
+
+    Exposes the same minimal API used by the loaders: has_next()/read_next(),
+    where read_next() returns (topic_name, data_bytes, timestamp_ns).
+    """
+    def __init__(self, bag_path, topic_filter=None):
+        db = _find_db3(bag_path)
+        if not db:
+            raise RuntimeError(f'No .db3/.mcap file found in {bag_path}')
+        self._conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+        self._cur = self._conn.cursor()
+        # topic id -> name
+        try:
+            self._cur.execute('SELECT id, name FROM topics')
+        except sqlite3.DatabaseError as e:
+            raise RuntimeError(f'Cannot read topics table: {e}')
+        self._id2name = {row[0]: row[1] for row in self._cur.fetchall()}
+        if topic_filter:
+            ids = [tid for tid, nm in self._id2name.items() if nm == topic_filter]
+            if ids:
+                ph = ','.join('?' * len(ids))
+                self._cur.execute(
+                    f'SELECT topic_id, data, timestamp FROM messages '
+                    f'WHERE topic_id IN ({ph}) ORDER BY timestamp', ids)
+            else:
+                self._cur.execute(
+                    'SELECT topic_id, data, timestamp FROM messages WHERE 0')
+        else:
+            self._cur.execute(
+                'SELECT topic_id, data, timestamp FROM messages ORDER BY timestamp')
+        self._next = self._fetch()
+
+    def _fetch(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        tid, data, t_ns = row
+        return (self._id2name.get(tid, ''), data, t_ns)
+
+    def has_next(self):
+        return self._next is not None
+
+    def read_next(self):
+        cur = self._next
+        self._next = self._fetch()
+        return cur
+
+
+def scan_bag(bag_path):
+    # Preferred path: rosbag2_py (needs a valid metadata.yaml)
+    try:
+        reader = _try_rosbag2_reader(bag_path)
+        result = {}
+        for t in reader.get_all_topics_and_types():
+            dt = TYPE_MAP.get(t.type)
+            if dt:
+                result.setdefault(dt, []).append(t.name)
+        return result
+    except Exception:
+        pass
+    # Fallback: read topics straight from the .db3 SQLite file
+    db = _find_db3(bag_path)
+    if not db:
+        raise RuntimeError(f'No .db3/.mcap storage file found in {bag_path}')
+    result = {}
+    conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+    try:
+        for _id, name, mtype in conn.execute('SELECT id, name, type FROM topics'):
+            dt = TYPE_MAP.get(mtype)
+            if dt:
+                result.setdefault(dt, []).append(name)
+    finally:
+        conn.close()
+    if not result:
+        raise RuntimeError('No supported topics found in bag storage.')
+    return result
+
+
+def _open_reader(bag_path, topic=None):
+    """Open a bag for reading. Tries rosbag2_py first; if that fails (e.g. empty
+    metadata.yaml), falls back to direct SQLite access filtered to `topic`."""
+    try:
+        return _try_rosbag2_reader(bag_path)
+    except Exception:
+        if not _find_db3(bag_path):
+            raise
+        return _SqliteBagReader(bag_path, topic_filter=topic)
+
+
 def load_imu_data(bag_path, topic, progress_cb=None):
-    reader = _open_reader(bag_path)
+    reader = _open_reader(bag_path, topic)
     ts, ax, ay, az, gx, gy, gz = [], [], [], [], [], [], []
     first_ns, count = None, 0
     while reader.has_next():
@@ -196,7 +317,7 @@ def load_imu_data(bag_path, topic, progress_cb=None):
 
 
 def load_pose_data(bag_path, topic, progress_cb=None):
-    reader = _open_reader(bag_path)
+    reader = _open_reader(bag_path, topic)
     ts, px, py, pz, qx, qy, qz, qw = [], [], [], [], [], [], [], []
     first_ns, count = None, 0
     while reader.has_next():
@@ -224,7 +345,7 @@ def load_pose_data(bag_path, topic, progress_cb=None):
 
 
 def load_image_data(bag_path, topic, progress_cb=None):
-    reader = _open_reader(bag_path)
+    reader = _open_reader(bag_path, topic)
     ts, images = [], []
     first_ns, count = None, 0
     while reader.has_next():
@@ -245,10 +366,47 @@ def load_image_data(bag_path, topic, progress_cb=None):
             'start_dt': datetime.fromtimestamp(first_ns/1e9) if first_ns else None}
 
 
+def load_gps_data(bag_path, topic, progress_cb=None):
+    """Load mavros_msgs/GPSRAW: lat/lon/alt (position) + yaw/CoG (heading)."""
+    reader = _open_reader(bag_path, topic)
+    ts, lat, lon, alt, yaw, cog, sat, fix = [], [], [], [], [], [], [], []
+    first_ns, count = None, 0
+    while reader.has_next():
+        tpc, data, t_ns = reader.read_next()
+        if tpc != topic:
+            continue
+        if first_ns is None:
+            first_ns = t_ns
+        m = deserialize_message(data, GPSRAW)
+        ts.append((t_ns - first_ns) * 1e-9)
+        # lat/lon in degE7 -> degrees; alt in mm -> metres
+        lat.append(m.lat / 1e7)
+        lon.append(m.lon / 1e7)
+        alt.append(m.alt / 1e3)
+        # yaw/cog in centidegrees -> degrees; sentinel UINT16_MAX (65535) => NaN
+        yaw.append(m.yaw / 100.0 if m.yaw != 65535 else float('nan'))
+        cog.append(m.cog / 100.0 if m.cog != 65535 else float('nan'))
+        sat.append(m.satellites_visible if m.satellites_visible != 255 else 0)
+        fix.append(m.fix_type)
+        count += 1
+        if progress_cb and count % 5000 == 0:
+            progress_cb(count)
+    ts = np.array(ts, dtype=np.float32)
+    dur = ts[-1] - ts[0] if len(ts) > 1 else 0
+    return {'ts': ts,
+            'lat': np.array(lat, np.float32), 'lon': np.array(lon, np.float32),
+            'alt': np.array(alt, np.float32), 'yaw': np.array(yaw, np.float32),
+            'cog': np.array(cog, np.float32), 'sat': np.array(sat, np.float32),
+            'fix': np.array(fix, np.float32),
+            'n': count, 'duration': dur,
+            'start_dt': datetime.fromtimestamp(first_ns/1e9) if first_ns else None}
+
+
 DATA_LOADERS = {
     DT_IMU:   load_imu_data,
     DT_POSE:  load_pose_data,
     DT_IMAGE: load_image_data,
+    DT_GPS:   load_gps_data,
 }
 
 # ===========================================================================
@@ -276,9 +434,12 @@ class SensorViewer(QMainWindow):
         self._img_timer = QTimer(self)
         self._img_timer.timeout.connect(self._img_next_frame)
 
+        # GPS overlay (GPS1 vs GPS2) state
+        self._overlay_topic = None
+
         self.setWindowTitle("Sensor Data Viewer")
         self.setMinimumSize(1100, 650)
-        self.resize(1400, 820)
+        self.resize(1500, 880)
 
         self._setup_ui()
         self._setup_menu()
@@ -299,7 +460,7 @@ class SensorViewer(QMainWindow):
         splitter.addWidget(self._build_chart_area())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([240, 1100])
+        splitter.setSizes([300, 1180])
         root.addWidget(splitter)
 
         self._status = QStatusBar()
@@ -310,30 +471,37 @@ class SensorViewer(QMainWindow):
     def _build_control_panel(self):
         panel = QWidget()
         self._panel_layout = QVBoxLayout(panel)
-        self._panel_layout.setContentsMargins(4, 4, 4, 4)
-        self._panel_layout.setSpacing(8)
+        self._panel_layout.setContentsMargins(6, 6, 6, 6)
+        self._panel_layout.setSpacing(10)
 
-        lbl = QLabel("Data Type"); lbl.setFont(QFont("", 11, QFont.Bold))
+        lbl = QLabel("Data Type"); lbl.setFont(QFont("", 13, QFont.Black))
         self._panel_layout.addWidget(lbl)
 
         self._type_combo = QComboBox()
-        self._type_combo.setMinimumHeight(28)
+        self._type_combo.setMinimumHeight(34)
         self._type_combo.currentTextChanged.connect(self._on_type_changed)
         self._panel_layout.addWidget(self._type_combo)
 
-        lbl2 = QLabel("Topic"); lbl2.setFont(QFont("", 11, QFont.Bold))
+        lbl2 = QLabel("Topic"); lbl2.setFont(QFont("", 13, QFont.Black))
         self._panel_layout.addWidget(lbl2)
 
         self._topic_combo = QComboBox()
-        self._topic_combo.setMinimumHeight(28)
+        self._topic_combo.setMinimumHeight(34)
         self._topic_combo.currentTextChanged.connect(self._on_topic_changed)
         self._panel_layout.addWidget(self._topic_combo)
+
+        # GPS overlay toggle (GPS1 vs GPS2)
+        self._gps_overlay_cb = QCheckBox("Overlay GPS1 & GPS2")
+        self._gps_overlay_cb.setFont(QFont("", 11, QFont.Bold))
+        self._gps_overlay_cb.stateChanged.connect(self._on_overlay_toggled)
+        self._gps_overlay_cb.hide()
+        self._panel_layout.addWidget(self._gps_overlay_cb)
 
         line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken)
         self._panel_layout.addWidget(line)
 
         self._section_label = QLabel("Channels")
-        self._section_label.setFont(QFont("", 11, QFont.Bold))
+        self._section_label.setFont(QFont("", 13, QFont.Black))
         self._panel_layout.addWidget(self._section_label)
 
         self._ch_container = QWidget()
@@ -352,27 +520,30 @@ class SensorViewer(QMainWindow):
         # Image nav
         self._img_nav = QWidget()
         nav_l = QVBoxLayout(self._img_nav)
-        nav_l.setContentsMargins(0, 0, 0, 0); nav_l.setSpacing(4)
+        nav_l.setContentsMargins(0, 0, 0, 0); nav_l.setSpacing(6)
 
         self._img_frame_label = QLabel("Frame: 0 / 0")
+        self._img_frame_label.setFont(QFont("", 11, QFont.Bold))
         self._img_frame_label.setAlignment(Qt.AlignCenter)
         nav_l.addWidget(self._img_frame_label)
 
         self._img_slider = QSlider(Qt.Horizontal)
         self._img_slider.setMinimum(0)
+        self._img_slider.setMinimumHeight(26)
         self._img_slider.setTracking(False)
         self._img_slider.valueChanged.connect(self._on_img_slider)
         nav_l.addWidget(self._img_slider)
 
-        img_btn_row = QHBoxLayout(); img_btn_row.setSpacing(4)
+        img_btn_row = QHBoxLayout(); img_btn_row.setSpacing(6)
         for text, slot in [("|<", self._img_first), ("<", self._img_prev),
                            ("Play", self._img_toggle_play), (">", self._img_next),
                            (">|", self._img_last)]:
-            b = QPushButton(text); b.setFixedWidth(40)
+            b = QPushButton(text); b.setFixedSize(50, 34)
             b.clicked.connect(slot); img_btn_row.addWidget(b)
         nav_l.addLayout(img_btn_row)
 
         self._img_ts_label = QLabel("t = --")
+        self._img_ts_label.setFont(QFont("", 10, QFont.Bold))
         self._img_ts_label.setAlignment(Qt.AlignCenter)
         self._img_ts_label.setStyleSheet("color: #555;")
         nav_l.addWidget(self._img_ts_label)
@@ -385,7 +556,8 @@ class SensorViewer(QMainWindow):
 
         self._info_label = QLabel("No data loaded")
         self._info_label.setWordWrap(True)
-        self._info_label.setStyleSheet("color: #888;")
+        self._info_label.setFont(QFont("", 10, QFont.Bold))
+        self._info_label.setStyleSheet("color: #666;")
         self._panel_layout.addWidget(self._info_label)
 
         self._panel_layout.addStretch()
@@ -400,6 +572,7 @@ class SensorViewer(QMainWindow):
         self._canvas = FigureCanvas(self._fig)
         self._axes = []
         self._toolbar = NavigationToolbar(self._canvas, self)
+        self._toolbar.setIconSize(QSize(28, 28))
 
         self._canvas.mpl_connect('scroll_event', self._on_scroll)
 
@@ -526,9 +699,25 @@ class SensorViewer(QMainWindow):
         self._topic_combo.clear()
         self._topic_combo.addItems(topics)
         default = next((t for t in topics if '/odin1/' in t), topics[0] if topics else None)
+        if data_type == DT_GPS:
+            default = next((t for t in topics if 'gps1' in t), default)
         if default:
             self._topic_combo.setCurrentText(default)
         self._topic_combo.blockSignals(False)
+
+        # GPS overlay checkbox: only when there are two GPS topics (gps1 + gps2)
+        if data_type == DT_GPS:
+            has1 = any('gps1' in t for t in topics)
+            has2 = any('gps2' in t for t in topics)
+            if has1 and has2:
+                self._gps_overlay_cb.show()
+            else:
+                self._gps_overlay_cb.hide()
+                self._gps_overlay_cb.setChecked(False)
+        else:
+            self._gps_overlay_cb.hide()
+            self._gps_overlay_cb.setChecked(False)
+        self._overlay_topic = None
 
         if data_type == DT_IMAGE:
             self._section_label.setText("Frame")
@@ -551,9 +740,11 @@ class SensorViewer(QMainWindow):
         self._cbs = {}
         for group_title, fields in CHANNEL_GROUPS.get(data_type, []):
             grp = QGroupBox(group_title)
+            grp.setFont(QFont("", 11, QFont.Bold))
             gl = QVBoxLayout(grp)
             for cb_label, key in fields:
                 cb = QCheckBox(cb_label)
+                cb.setFont(QFont("", 10, QFont.Bold))
                 cb.setChecked(True)
                 cb.stateChanged.connect(self._on_cb)
                 gl.addWidget(cb)
@@ -570,6 +761,9 @@ class SensorViewer(QMainWindow):
         if not self._bag_path or not self._current_dt:
             return
         self._current_topic = topic
+        # For GPS, refresh the overlay partner before display so it shows together
+        if self._current_dt == DT_GPS:
+            self._refresh_overlay()
         if topic in self._data:
             self._display_data(topic)
             return
@@ -590,6 +784,44 @@ class SensorViewer(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
             self._status_label.setText(f"Failed: {topic}")
+
+    # -- GPS overlay ----------------------------------------------------------
+
+    def _gps_partner_topic(self):
+        """Return the complementary GPS topic (gps1<->gps2) if present."""
+        topics = self._available.get(DT_GPS, [])
+        cur = self._current_topic
+        if not cur:
+            return None
+        if 'gps1' in cur:
+            return next((t for t in topics if 'gps2' in t), None)
+        if 'gps2' in cur:
+            return next((t for t in topics if 'gps1' in t), None)
+        return None
+
+    def _refresh_overlay(self):
+        """Sync self._overlay_topic with the checkbox state; load partner data
+        lazily so it is ready for plotting."""
+        if (self._current_dt != DT_GPS
+                or not getattr(self, '_gps_overlay_cb', None)
+                or not self._gps_overlay_cb.isChecked()):
+            self._overlay_topic = None
+            return
+        partner = self._gps_partner_topic()
+        self._overlay_topic = partner
+        if partner and partner not in self._data:
+            loader = DATA_LOADERS.get(DT_GPS)
+            if loader:
+                try:
+                    self._status_label.setText(f"Loading overlay {partner} ...")
+                    QApplication.processEvents()
+                    self._data[partner] = loader(self._bag_path, partner)
+                except Exception:
+                    self._overlay_topic = None
+
+    def _on_overlay_toggled(self):
+        self._refresh_overlay()
+        self._redraw()
 
     def _display_data(self, topic):
         data = self._data[topic]
@@ -617,7 +849,11 @@ class SensorViewer(QMainWindow):
                 for _, key in fields:
                     arr = data.get(key)
                     if arr is not None and len(arr) > 0:
-                        lines.append(f"  {key}: [{arr.min():.3f}, {arr.max():.3f}]")
+                        valid = arr[~np.isnan(arr)] if np.issubdtype(arr.dtype, np.floating) else arr
+                        if len(valid) > 0:
+                            lines.append(f"  {key}: [{valid.min():.3f}, {valid.max():.3f}]")
+                        else:
+                            lines.append(f"  {key}: N/A")
                     else:
                         lines.append(f"  {key}: N/A")
                 lines.append("")
@@ -637,13 +873,20 @@ class SensorViewer(QMainWindow):
         ts = data['ts']
         groups = CHANNEL_GROUPS.get(dt, [])
 
+        # Datasets to plot: list of (data_dict, label_suffix, linestyle).
+        # GPS overlay adds the complementary GPS topic (dashed) for comparison.
+        datasets = [(data, '', '-')]
+        if dt == DT_GPS and self._overlay_topic and self._overlay_topic in self._data:
+            od = self._data[self._overlay_topic]
+            tag = '2' if 'gps2' in self._overlay_topic else '1'
+            datasets.append((od, f' [{tag}]', '--'))
+
         # Save current view limits so zoom/pan survives checkbox toggles
         saved_lim = None
         if self._axes:
             saved_lim = [(ax.get_xlim(), ax.get_ylim()) for ax in self._axes]
 
         MAX_PTS = 6000
-        stride = max(1, len(ts) // MAX_PTS)
 
         self._fig.clear()
         n_grp = len(groups)
@@ -664,21 +907,29 @@ class SensorViewer(QMainWindow):
             ax.grid(True, alpha=0.3)
             ax.set_ylabel(grp_title)
             visible, labels = [], []
-            for fi, (_, key) in enumerate(fields):
-                if key in self._cbs and self._cbs[key].isChecked():
-                    arr = data.get(key)
-                    if arr is not None:
-                        line, = ax.plot(ts[::stride], arr[::stride],
-                                        color=COLORS[fi % 3], linewidth=0.5,
-                                        alpha=0.85, label=key)
-                        visible.append(line); labels.append(key)
-                        self._lod_lines.append((line, ts, arr))
+            for d_data, prefix, ls in datasets:
+                d_ts = d_data['ts']
+                d_stride = max(1, len(d_ts) // MAX_PTS)
+                for fi, (_, key) in enumerate(fields):
+                    if key in self._cbs and self._cbs[key].isChecked():
+                        arr = d_data.get(key)
+                        if arr is not None:
+                            lbl = f"{key}{prefix}"
+                            line, = ax.plot(d_ts[::d_stride], arr[::d_stride],
+                                            color=COLORS[fi % 3], linewidth=1.2,
+                                            linestyle=ls, alpha=0.9, label=lbl)
+                            visible.append(line); labels.append(lbl)
+                            self._lod_lines.append((line, d_ts, arr))
             if visible:
                 ax.legend(visible, labels, loc='upper right',
-                          fontsize=8, ncol=3, framealpha=0.6)
+                          fontsize=10, ncol=2, framealpha=0.7)
 
         self._axes[-1].set_xlabel("Time (s)")
-        self._axes[0].set_title(f"{self._current_topic}")
+        title = self._current_topic or ''
+        if dt == DT_GPS and self._overlay_topic:
+            tag = '2' if 'gps2' in self._overlay_topic else '1'
+            title += f"   (+ GPS{tag} overlay)"
+        self._axes[0].set_title(title)
 
         # Connect xlim callback for LOD (reconnect on every redraw since axes change)
         if self._lod_cid is not None:
@@ -850,10 +1101,33 @@ class SensorViewer(QMainWindow):
 # Entry point
 # ===========================================================================
 
+APP_STYLE = """
+QWidget { font-size: 11pt; }
+QLabel { font-weight: 600; }
+QPushButton { min-height: 28px; padding: 5px 14px; font-weight: 700; }
+QComboBox { min-height: 30px; }
+QComboBox QAbstractItemView { font-size: 11pt; }
+QCheckBox { font-weight: 600; spacing: 8px; }
+QCheckBox::indicator { width: 20px; height: 20px; }
+QGroupBox { font-weight: 700; font-size: 12pt; }
+QStatusBar { font-weight: 700; font-size: 11pt; }
+QStatusBar::item { border: none; }
+QMenuBar { font-size: 11pt; font-weight: 600; }
+QMenu { font-size: 11pt; }
+QSlider { min-height: 22px; }
+"""
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    app.setFont(QFont("Sans Serif", 11))
+    app.setStyleSheet(APP_STYLE)
     app.setQuitOnLastWindowClosed(True)
+
+    # Startup diagnostics (printed to the launching terminal)
+    print(f"[viewer] rosbag2: {'OK' if HAS_ROSBAG2 else 'MISSING - ' + ROSBAG_ERR}")
+    print(f"[viewer] GPS (mavros_msgs/GPSRAW): "
+          f"{'OK' if HAS_GPSRAW else 'MISSING - ' + GPSRAW_ERR}")
 
     config = load_config()
 

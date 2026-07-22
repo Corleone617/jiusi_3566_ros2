@@ -186,8 +186,8 @@ SERVICE_FILE="/tmp/acfly_daemon.service"
 cat > "$SERVICE_FILE" << SERVICE_EOF
 [Unit]
 Description=AcFly Flight Control Daemon (RK3588 autostart)
-After=multi-user.target
-Wants=multi-user.target
+StartLimitIntervalSec=60
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -195,17 +195,24 @@ User=$REAL_USER
 Environment="ROS_DOMAIN_ID=0"
 Environment="RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
 Environment="COLCON_CURRENT_PREFIX=$INSTALL_DIR"
+# /tmp 是 tmpfs，重启即清空；ExecStartPre 重建该目录供节点内部日志(*.log)使用
+# 切勿改回 StandardOutput=file:/tmp/...：ExecStartPre 会继承该设置，在目录创建前就要打开日志文件，触发 209/STDOUT 死锁
+ExecStartPre=/bin/mkdir -p /tmp/acfly_logs
+# 开机时 PX4 飞控 boot 需 ~15-30s，慢于 mavros 的 conn_timeout(10s)，mavros 启动过早会连不上飞控
+# 延迟 20s 等飞控就绪（若飞控 boot 更慢可调大），避免开机后必须手动 restart
+ExecStartPre=/bin/sleep 20
 ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && source $INSTALL_DIR/setup.bash && exec ros2 launch acfly_daemon acfly_daemon.launch.py"
 Restart=on-failure
 RestartSec=1s
-StartLimitBurst=20
-StartLimitIntervalSec=60
 TimeoutStartSec=50
 TimeoutStopSec=30
 KillMode=mixed
 KillSignal=SIGTERM
-StandardOutput=file:/tmp/acfly_logs/acfly_daemon.log
-StandardError=file:/tmp/acfly_logs/acfly_daemon.log
+# 赋予实时调度能力:odin SDK 的 IMU 线程需 SCHED_FIFO/SCHED_RR，非 root 下会 EPERM 回退默认调度
+# 切勿加 CapabilityBoundingSet 限定，否则会砍掉 timesync 二进制的 cap_sys_time 文件能力
+AmbientCapabilities=CAP_SYS_NICE
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=acfly_daemon
 
 [Install]
