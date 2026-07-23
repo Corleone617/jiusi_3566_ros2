@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # AcFly 部署脚本 — RK3588 专用（精简版）
-# 功能：① 检查系统依赖 + 工程二进制 ② 设置权限（setcap + 数据目录）
+# 功能：① 检查系统依赖 + 工程二进制 ② 设置权限（数据目录）
 #       ③ 禁用系统时间服务（避免与 timesync 抢时钟）④ 设置开机自启
 # 工程路径按脚本所在位置自动推导：offline/ 的父目录即工程根（含 install/）
 # 用法:  cd <工程根> && sudo ./offline/deploy_3588.sh
@@ -10,7 +10,7 @@
 set -e
 
 # ---- root 权限检查 ----
-# 本脚本要写 /etc/ld.so.conf.d、setcap、systemctl、/etc/systemd/system 等，必须 root
+# 本脚本要写 /etc/ld.so.conf.d、systemctl、/etc/systemd/system 等，必须 root
 if [ "$(id -u)" -ne 0 ]; then
     echo "============================================"
     echo "错误：本脚本需要 root 权限运行"
@@ -99,7 +99,7 @@ for bin in \
 done
 echo "  工程关键二进制齐全 ✓"
 
-# ldconfig: 把 ROS2 库路径写进 ld.so.conf（setcap 安全模式下 dlopen 不走 LD_LIBRARY_PATH）
+# ldconfig: 把 ROS2 库路径写进 ld.so.conf（统一走 ld.so.cache，避免依赖 LD_LIBRARY_PATH）
 ROS_LDCONF="/etc/ld.so.conf.d/ros2-humble.conf"
 if [ ! -f "$ROS_LDCONF" ] || ! grep -q "/opt/ros/humble/lib" "$ROS_LDCONF" 2>/dev/null; then
     echo "/opt/ros/humble/lib" | tee "$ROS_LDCONF" > /dev/null
@@ -112,20 +112,13 @@ ldconfig 2>/dev/null || true
 echo "  ld.so.conf 注册 ROS2 库路径 ✓"
 
 # ============================================================
-# [2/5] 设置权限（setcap + 数据目录）
+# [2/5] 设置权限（数据目录）
 # ============================================================
 echo ""
 echo "[2/5] 设置权限..."
 
-# timesync 需要 cap_sys_time 才能 clock_settime/adjtimex
-# 注意：每次 colcon build 后 capability 丢失，需重新执行本步
-TIMESYNC_BIN="$INSTALL_DIR/timesync/lib/timesync/time_sync_node"
-setcap cap_sys_time+ep "$TIMESYNC_BIN"
-echo "  setcap cap_sys_time → timesync ✓"
-if ldd "$TIMESYNC_BIN" 2>&1 | grep -q "not found"; then
-    echo "  ! 警告: timesync 依赖库缺失（setcap 安全模式下走 ld.so.cache）："
-    ldd "$TIMESYNC_BIN" 2>&1 | grep "not found"
-fi
+# timesync 的 cap_sys_time 由 acfly_daemon.service 的 AmbientCapabilities 授予
+# （见 [5/5]），不再用 setcap 文件能力——因此 colcon build 覆盖二进制后无需重新授权。
 
 mkdir -p /data/bags /tmp/acfly_logs
 chown -R "$REAL_USER:$REAL_USER" /data/bags /tmp/acfly_logs
@@ -198,9 +191,8 @@ Environment="COLCON_CURRENT_PREFIX=$INSTALL_DIR"
 # /tmp 是 tmpfs，重启即清空；ExecStartPre 重建该目录供节点内部日志(*.log)使用
 # 切勿改回 StandardOutput=file:/tmp/...：ExecStartPre 会继承该设置，在目录创建前就要打开日志文件，触发 209/STDOUT 死锁
 ExecStartPre=/bin/mkdir -p /tmp/acfly_logs
-# 开机时 PX4 飞控 boot 需 ~15-30s，慢于 mavros 的 conn_timeout(10s)，mavros 启动过早会连不上飞控
-# 延迟 20s 等飞控就绪（若飞控 boot 更慢可调大），避免开机后必须手动 restart
-ExecStartPre=/bin/sleep 20
+
+ExecStartPre=/bin/sleep 10
 ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && source $INSTALL_DIR/setup.bash && exec ros2 launch acfly_daemon acfly_daemon.launch.py"
 Restart=on-failure
 RestartSec=1s
@@ -208,9 +200,12 @@ TimeoutStartSec=50
 TimeoutStopSec=30
 KillMode=mixed
 KillSignal=SIGTERM
-# 赋予实时调度能力:odin SDK 的 IMU 线程需 SCHED_FIFO/SCHED_RR，非 root 下会 EPERM 回退默认调度
-# 切勿加 CapabilityBoundingSet 限定，否则会砍掉 timesync 二进制的 cap_sys_time 文件能力
-AmbientCapabilities=CAP_SYS_NICE
+# CAP_SYS_NICE: odin SDK 的 IMU 线程需 SCHED_FIFO/SCHED_RR，非 root 下会 EPERM 回退默认调度
+# CAP_SYS_TIME: timesync 需 clock_settime/adjtimex 调服 CLOCK_REALTIME。改用 AmbientCapabilities
+#   授予（替代 setcap 文件能力），colcon build 覆盖二进制后不再丢失，免重新 setcap。
+#   代价：daemon 所有子进程都会继承 CAP_SYS_TIME——本机受控部署下可接受。
+# 切勿加 CapabilityBoundingSet 限定，否则会砍掉此处授予的 ambient 能力。
+AmbientCapabilities=CAP_SYS_NICE CAP_SYS_TIME
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=acfly_daemon
@@ -239,7 +234,4 @@ echo "  服务日志: journalctl -u acfly_daemon -f"
 echo "  daemon/子进程日志: /tmp/acfly_logs/"
 echo "  手动启动: acfly-start   手动停止: acfly-stop"
 echo "  取消自启: sudo systemctl disable acfly_daemon"
-echo "--------------------------------------------"
-echo "  提示: 每次 colcon build 后需重新 setcap："
-echo "    sudo setcap cap_sys_time+ep $TIMESYNC_BIN"
 echo "============================================"

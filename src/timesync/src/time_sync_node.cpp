@@ -278,19 +278,22 @@ private:
   }
 
   // 微调：用 ADJ_OFFSET_SINGLESHOT 渐进式 slew（单次渐进调整）
-  // 重要：绝不使用 STA_PLL/ADJ_OFFSET 的内核 PLL 频率纪律——
-  //   旧版用 STA_PLL 每秒喂 offset，内核 PLL 会持续积分频率估计，
-  //   ~5 分钟后频率 windup 导致控制环发散（offset 从 0 冲到 -500ms+，触发 re-bootstrap 死循环）。
-  //   ADJ_OFFSET_SINGLESHOT 是单次 slew，不激活 PLL、不积分频率，根除 windup。
-  //   内核默认以 ~500ppm 速率渐进消化 offset，配合每秒测量+重喂可稳定跟踪。
+  // 重要：绝不使用 STA_PLL/ADJ_OFFSET 的内核 PLL 频率纪律（旧版 windup 5min 发散）。
+  //
+  // 增益控制：每秒只喂 offset 的 1/20 给内核，而非完整 offset。
+  //   完整 offset + 每秒重喂 → 内核以 ~0.5ms/s 恒定速率持续 slew = 积分作用，
+  //   配合测量滞后（平滑窗口）必然发散（实测 window=300 ~40min、window=30 更快）。
+  //   喂 offset/20 → 每秒只修正 ~5%，把积分作用变成比例衰减，
+  //   环路增益×滞后 < 1 → 稳定单调收敛（时间常数 ~20s，足够跟踪 RTC 的 ppm 级漂移）。
   //   平台无关的标准 Linux API，RK3566/3588 ARM64 同样适用。
   void apply_slew(double offset_ms)
   {
     struct timex tx = {};
     tx.modes = ADJ_OFFSET_SINGLESHOT;                 // 单次渐进 slew（无 PLL 频率纪律）
 
-    long offset_us = static_cast<long>(offset_ms * 1000.0);
-    long max_step_us = 100000;                        // 每次最多 ±100ms
+    // 增益 1/20：避免恒定速率 slew 的积分 windup（见上方注释）
+    long offset_us = static_cast<long>(offset_ms * 1000.0 / 20.0);
+    long max_step_us = 100000;                        // 每次最多 ±100ms（实际远到不了）
     if (offset_us > max_step_us) offset_us = max_step_us;
     if (offset_us < -max_step_us) offset_us = -max_step_us;
 

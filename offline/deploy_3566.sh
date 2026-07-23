@@ -108,7 +108,7 @@ else
     echo "  全部依赖已安装 ✓"
 fi
 
-# ldconfig: 确保 /opt/ros/humble/lib 在链接器搜索路径中（dlopen 不走 LD_LIBRARY_PATH）
+# ldconfig: 确保 /opt/ros/humble/lib 在链接器搜索路径中（统一走 ld.so.cache）
 ROS_LDCONF="/etc/ld.so.conf.d/ros2-humble.conf"
 if [ ! -f "$ROS_LDCONF" ] || ! grep -q "/opt/ros/humble/lib" "$ROS_LDCONF" 2>/dev/null; then
     echo "/opt/ros/humble/lib" | sudo tee "$ROS_LDCONF" > /dev/null
@@ -182,16 +182,11 @@ echo -1 | sudo tee /sys/module/usbcore/parameters/autosuspend > /dev/null 2>&1 |
 echo ""
 echo "[4/8] 设置权限..."
 
+# timesync 的 cap_sys_time 由 acfly_daemon.service 的 AmbientCapabilities 授予
+# （见 [7/8]），不再用 setcap 文件能力，colcon build 后无需重新授权。
 TIMESYNC_BIN="$INSTALL_DIR/timesync/lib/timesync/time_sync_node"
 if [ -f "$TIMESYNC_BIN" ]; then
-    sudo setcap cap_sys_time+ep "$TIMESYNC_BIN"
-    echo "  setcap timesync ✓"
-    if ldd "$TIMESYNC_BIN" 2>&1 | grep -q "not found"; then
-        echo "  ! 警告: timesync 依赖库缺失，请检查 ldconfig:"
-        ldd "$TIMESYNC_BIN" 2>&1 | grep "not found"
-    else
-        echo "  timesync 依赖库完整 ✓"
-    fi
+    echo "  timesync 二进制就绪 ✓"
 else
     echo "  ! timesync 二进制未找到: $TIMESYNC_BIN"
 fi
@@ -278,9 +273,8 @@ Environment="COLCON_CURRENT_PREFIX=$INSTALL_DIR"
 # /tmp 是 tmpfs，重启即清空；ExecStartPre 重建该目录供节点内部日志(*.log)使用
 # 切勿改回 StandardOutput=file:/tmp/...：ExecStartPre 会继承该设置，在目录创建前就要打开日志文件，触发 209/STDOUT 死锁
 ExecStartPre=/bin/mkdir -p /tmp/acfly_logs
-# 开机时 PX4 飞控 boot 需 ~15-30s，慢于 mavros 的 conn_timeout(10s)，mavros 启动过早会连不上飞控
-# 延迟 20s 等飞控就绪（若飞控 boot 更慢可调大），避免开机后必须手动 restart
-ExecStartPre=/bin/sleep 20
+
+ExecStartPre=/bin/sleep 10
 ExecStart=/bin/bash -c "\
   source /opt/ros/humble/setup.bash && \
   source $INSTALL_DIR/setup.bash && \
@@ -292,9 +286,12 @@ TimeoutStartSec=50
 TimeoutStopSec=30
 KillMode=mixed
 KillSignal=SIGTERM
-# 赋予实时调度能力:odin SDK 的 IMU 线程需 SCHED_FIFO/SCHED_RR，非 root 下会 EPERM 回退默认调度
-# 切勿加 CapabilityBoundingSet 限定，否则会砍掉 timesync 二进制的 cap_sys_time 文件能力
-AmbientCapabilities=CAP_SYS_NICE
+# CAP_SYS_NICE: odin SDK 的 IMU 线程需 SCHED_FIFO/SCHED_RR，非 root 下会 EPERM 回退默认调度
+# CAP_SYS_TIME: timesync 需 clock_settime/adjtimex 调服 CLOCK_REALTIME。改用 AmbientCapabilities
+#   授予（替代 setcap 文件能力），colcon build 覆盖二进制后不再丢失，免重新 setcap。
+#   代价：daemon 所有子进程都会继承 CAP_SYS_TIME——本机受控部署下可接受。
+# 切勿加 CapabilityBoundingSet 限定，否则会砍掉此处授予的 ambient 能力。
+AmbientCapabilities=CAP_SYS_NICE CAP_SYS_TIME
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=acfly_daemon

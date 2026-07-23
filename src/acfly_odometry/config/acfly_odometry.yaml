@@ -1,0 +1,30 @@
+# Acfly odometry configuration
+#
+# Fuses Odin1 SLAM odometry (yaw + position) with FCU IMU attitude (roll/pitch),
+# outputs gravity-aligned odometry to /mavros/odometry/out for the FCU EKF.
+# Also monitors SLAM covariance and triggers Odin1 reset on degradation.
+#
+# Loaded by acfly_odometry.launch.py (which the daemon invokes via ros2 launch).
+# If any value is omitted here, the code default in acfly_odometry_node.cpp applies.
+
+acfly_odometry:
+  ros__parameters:
+    # ---- 基础参数 ----
+    output_rate: 20.0            # 输出频率 (Hz)
+    odom_frame: "map"           # 里程计父坐标系
+    child_frame: "base_link"    # 里程计子坐标系（机体）
+    attitude_alignment_sec: 5.0 # 姿态对齐窗口时长 (s)
+
+    # ---- 传感器安装角补偿 (°) ----
+    # q_mount = Rz(yaw) * Ry(pitch) * Rx(roll)
+    # Odin1 前倾 45° 安装，需 pitch 补偿
+    mount_roll_deg: 0.0
+    mount_pitch_deg: 45.0
+    mount_yaw_deg: 0.0
+
+    # ---- 协方差退化检测 ----
+    cov_check_enabled: true       # 启用协方差检测
+    cov_pos_threshold: 0.25       # 位置协方差阈值 (m²)
+    cov_att_threshold_deg2: 1.0   # 姿态协方差阈值 (deg²)
+    cov_degrade_bound: 20         # 连续超限计数阈值，触发 Odin1 复位
+    reset_cooldown_sec: 2.0       # 复位冷却时间 (s)

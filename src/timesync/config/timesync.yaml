@@ -11,13 +11,22 @@
 #   TRACKING  -> HOLD (GPS timeout)
 #   HOLD      -> TRACKING (GPS restored)
 #
-# Requires CAP_SYS_TIME for clock_settime / adjtimex:
-#   sudo setcap cap_sys_time+ep install/timesync/lib/timesync/time_sync_node
+# Note on window_size: the slew loop tracks /mavros/time_reference (FCU RTC).
+# A large window introduces phase lag that destabilizes the proportional slew
+# loop (offset oscillates with period ~window_size, growing amplitude). Keep
+# window_size small (≤ ~30) so the smoothed offset tracks fast enough vs the
+# 0.5 ms/s slew rate; a 300-sample window reproduces a ~10 min divergence.
+#
+# Requires CAP_SYS_TIME for clock_settime / adjtimex.
+# Granted via AmbientCapabilities in acfly_daemon.service (see offline/deploy_*.sh),
+# not file capabilities, so no manual setcap is needed after colcon build.
 
 mavros_time_sync:
   ros__parameters:
-    # Number of offset samples kept in the sliding window for smoothing
-    window_size: 300
+    # Number of offset samples kept in the sliding window for smoothing.
+    # Keep small (≤~30): large windows add phase lag that destabilizes the slew
+    # loop (see header). 300 reproduces a ~10 min exponential divergence.
+    window_size: 30
 
     # Offset threshold (ms) above which a bootstrap (hard clock_settime) is triggered
     bootstrap_threshold_ms: 500.0

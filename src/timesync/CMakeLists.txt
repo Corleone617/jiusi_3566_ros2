@@ -21,12 +21,6 @@ set_target_properties(time_sync_node PROPERTIES
 install(TARGETS time_sync_node
   DESTINATION lib/${PROJECT_NAME})
 
-install(CODE "
-  message(STATUS \"timesync: 权限需部署时手动设置:\")
-  message(STATUS \"  sudo setcap cap_sys_time+ep <prefix>/lib/timesync/time_sync_node\")
-  message(STATUS \"  或运行 deploy.sh 自动设置\")
-")
-
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config)
 

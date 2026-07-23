@@ -26,7 +26,7 @@ disk_check_interval_sec: 5
 
 # Auto-cleanup: when cleanup_mode is "auto", all old bags are deleted
 # on ARM before opening a new bag.  Set to "retain" to keep everything.
-cleanup_mode: "retain"  # "auto" or "retain"
+cleanup_mode: "auto"  # "auto" or "retain"
 
 # Arm-state-triggered recording
 arm_record:

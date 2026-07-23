@@ -8,5 +8,6 @@ odin_bag/
 __pycache__/
 install_716.zip
 tool/mask/.venv_build/
+tool/ros2bag_viewer/viewer_config.json
 *_716.zip
 .vscode/

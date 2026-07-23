@@ -3,19 +3,24 @@
 # 输出重力对齐的组合里程计 /mavros/odometry/out，注入飞控 EKF 估计器
 # 同时监控 SLAM 协方差，退化时自动触发 Odin1 复位
 
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    config_yaml = os.path.join(
+        get_package_share_directory("acfly_odometry"),
+        "config", "acfly_odometry.yaml")
+
     acfly_odometry_node = Node(
         package="acfly_odometry",
         executable="acfly_odometry_node",
         name="acfly_odometry",
         output="screen",
-        parameters=[{
-            "mount_pitch_deg": 45.0,  # Odin1 传感器前倾 45° 安装角补偿
-        }],
+        parameters=[config_yaml],
     )
 
     return LaunchDescription([acfly_odometry_node])

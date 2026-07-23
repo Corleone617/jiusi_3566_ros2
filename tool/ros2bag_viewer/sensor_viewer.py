@@ -11,8 +11,8 @@ Usage:
     ./run_viewer.sh [bag_path]
     source /opt/ros/humble/setup.bash && python3 sensor_viewer.py [bag_path]
 
-The config file (viewer_config.json) saves recent bags and last-used bag,
-and is created automatically next to this script.  Edit it to set defaults.
+Recent bags / last-used bag are kept in memory only for the current session
+(no config file is written to disk).
 
 Mouse interactions:
     Scroll wheel          - Zoom in/out centered on cursor
@@ -32,7 +32,6 @@ Keyboard shortcuts:
 import sys
 import os
 import io
-import json
 import glob
 import sqlite3
 import numpy as np
@@ -102,32 +101,19 @@ matplotlib.rcParams.update({
 })
 
 # ===========================================================================
-# Config
+# Config (in-memory only; nothing is written to disk)
 # ===========================================================================
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, 'viewer_config.json')
 
 def load_config():
-    """Load viewer_config.json, return dict. Defaults applied for missing keys."""
-    defaults = {'recent_bags': [], 'last_bag': ''}
-    try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH) as f:
-                d = json.load(f)
-            for k, v in defaults.items():
-                d.setdefault(k, v)
-            return d
-    except Exception:
-        pass
-    return defaults
+    """Return an empty config dict. State is kept in memory only — no file is
+    read or written, so recent bags do not persist across runs."""
+    return {'recent_bags': [], 'last_bag': ''}
 
 def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass  # silently ignore permission errors
+    """No-op: persistence is disabled to avoid writing any config file."""
+    return
 
 # ===========================================================================
 # Data model

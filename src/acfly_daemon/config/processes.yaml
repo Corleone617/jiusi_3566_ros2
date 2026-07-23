@@ -27,14 +27,18 @@ processes:
 
   - name: timesync
     command: "ros2"
-    args: ["run", "timesync", "time_sync_node"]
+    # 用 ros2 launch 而非 ros2 run：timesync.launch.py 里写了 parameters=[config_yaml]，
+    # 这样 timesync.yaml 才会被加载（ros2 run 不传 --params-file，参数全走代码默认值）。
+    # 与 mavros 的启动方式一致。
+    args: ["launch", "timesync", "timesync.launch.py"]
     auto_restart: true
     dependencies: ["mavros"]
     wait_for_topics: ["/mavros/time_reference", "/mavros/timesync_status"]
 
   - name: acfly_odometry
     command: "ros2"
-    args: ["run", "acfly_odometry", "acfly_odometry_node"]
+    # 用 ros2 launch 加载 acfly_odometry.yaml（与 timesync/mavros 一致）
+    args: ["launch", "acfly_odometry", "acfly_odometry.launch.py"]
     auto_restart: true
     dependencies: ["mavros", "odin1_driver"]
     wait_for_topics: ["/mavros/imu/data", "/odin1/odometry_highfreq"]
