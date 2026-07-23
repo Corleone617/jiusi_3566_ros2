@@ -58,6 +58,13 @@ topics:
     qos: "reliable"
     depth: 100
 
+  # acfly_odometry 协方差退化诊断（20Hz，与 /mavros/odometry/out 同频）
+  # 含 max_pos_cov / max_att_cov / degrade_cnt / reset_triggered，供离线分析 SLAM 退化
+  - name: "/acfly_odometry/cov_diag"
+    type: "acfly_odometry/msg/CovDiag"
+    qos: "reliable"
+    depth: 100
+
   # - name: "/odin1/odometry_highfreq"
   #   type: "nav_msgs/msg/Odometry"
   #   qos: "reliable"

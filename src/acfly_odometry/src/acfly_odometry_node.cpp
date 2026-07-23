@@ -14,6 +14,7 @@
 //   统计连续协方差超限的帧数，超过 cov_degrade_bound 次（≈1.5s @20Hz）则写复位命令到文件
 
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <mutex>
@@ -25,6 +26,8 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.h>
+
+#include "acfly_odometry/msg/cov_diag.hpp"
 
 class OdomGravityAlignNode : public rclcpp::Node
 {
@@ -46,7 +49,7 @@ public:
     declare_parameter("cov_check_enabled", true);        // 启用协方差检测
     declare_parameter("cov_pos_threshold", 0.25);        // 位置协方差阈值 (m²)
     declare_parameter("cov_att_threshold_deg2", 1.0);    // 姿态协方差阈值 (deg²)
-    declare_parameter("cov_degrade_bound", 20);          // 连续超限计数阈值
+    declare_parameter("cov_degrade_bound", 10);          // 连续超限计数阈值
     declare_parameter("reset_cooldown_sec", 2.0);        // 复位冷却时间 (s)
 
     output_rate_ = get_parameter("output_rate").as_double();
@@ -97,9 +100,13 @@ public:
       rclcpp::SensorDataQoS(),
       std::bind(&OdomGravityAlignNode::att_cb, this, std::placeholders::_1));
 
-    // 发布融合后里程计到 /mavros/odometry/out（飞控 EKF 输入）
+    // 发布融合后里程计到 /mavros/odometry/out（飞控输入）
     aligned_pub_ = create_publisher<nav_msgs::msg::Odometry>(
       "/mavros/odometry/out", rclcpp::QoS(10).reliable());
+
+    // 发布协方差退化诊断（与 odom 同频 20Hz，供 bag 录制后离线分析）
+    cov_diag_pub_ = create_publisher<acfly_odometry::msg::CovDiag>(
+      "/acfly_odometry/cov_diag", rclcpp::QoS(10).reliable());
 
     // 定时器以 output_rate_ 频率触发融合和发布
     auto period = std::chrono::milliseconds(
@@ -112,34 +119,8 @@ public:
   }
 
 private:
-  // 检查里程计协方差是否退化
-  // 当 pos_cov > pos_thresh 或 att_cov > att_thresh_deg2 累计超过 degrade_bound 次返回 true
-  bool checkCovarianceDeagation(
-      const std::array<double, 36>& covariance,
-      double pos_thresh, double att_thresh_deg2, int degrade_bound)
-  {
-    // rad² → deg² 换算系数
-    const double rad2_to_deg2 = (180.0 / M_PI) * (180.0 / M_PI);
-
-    // 检查协方差矩阵对角线元素：索引 0/7/14 为位置方差，21/28/35 为姿态方差 (rad²)
-    bool degraded = (covariance[0]  > pos_thresh ||
-                     covariance[7]  > pos_thresh ||
-                     covariance[14] > pos_thresh ||
-                     covariance[21] * rad2_to_deg2 > att_thresh_deg2 ||
-                     covariance[28] * rad2_to_deg2 > att_thresh_deg2 ||
-                     covariance[35] * rad2_to_deg2 > att_thresh_deg2);
-
-    if (degraded) {
-      cov_degrade_cnt_++;                            // 超限累计
-    } else {
-      if (cov_degrade_cnt_ > 0) cov_degrade_cnt_--;  // 正常则缓慢恢复
-    }
-    if (cov_degrade_cnt_ > degrade_bound) {
-      cov_degrade_cnt_ = 0;
-      return true;
-    }
-    return false;
-  }
+  // 协方差退化检测逻辑已内联到 timer_cb（每帧算 max cov + 更新计数 + 发诊断话题，
+  // 不再单独成函数，因为它和诊断发布/复位触发紧耦合）。
 
   // 发布静态坐标变换：map → odom, map → odin1_odom（均为 identity）
   void publish_static_tfs()
@@ -201,30 +182,55 @@ private:
       return;
     }
 
-    // ---- 协方差退化检测 → 触发 Odin1 SLAM 复位 ----
+    // ---- 协方差诊断 + 退化检测（每帧执行，与 odom 同频）----
+    // 每帧计算 max cov + 更新计数 + 发诊断话题；复位触发受冷却期限制。
+    // 诊断在复位抑制期（下方 1s 抑制）也照发，便于离线观察协方差恢复曲线。
+    acfly_odometry::msg::CovDiag cov_diag;
+    cov_diag.header.stamp = odom->header.stamp;
+    cov_diag.degrade_bound = cov_degrade_bound_;
+    cov_diag.degrade_cnt = cov_degrade_cnt_;
+    cov_diag.reset_triggered = false;
+
+    // 协方差矩阵对角线：索引 0/7/14 位置方差(m²)，21/28/35 姿态方差(rad²)
+    const double rad2_to_deg2 = (180.0 / M_PI) * (180.0 / M_PI);
+    cov_diag.max_pos_cov = std::max({odom->pose.covariance[0],
+                                     odom->pose.covariance[7],
+                                     odom->pose.covariance[14]});
+    cov_diag.max_att_cov_deg2 = std::max({odom->pose.covariance[21],
+                                          odom->pose.covariance[28],
+                                          odom->pose.covariance[35]}) * rad2_to_deg2;
+
     if (cov_check_enabled_) {
+      bool degraded = (cov_diag.max_pos_cov > cov_pos_threshold_ ||
+                       cov_diag.max_att_cov_deg2 > cov_att_threshold_deg2_);
+      if (degraded) {
+        cov_degrade_cnt_++;                          // 超限累计
+      } else if (cov_degrade_cnt_ > 0) {
+        cov_degrade_cnt_--;                          // 正常则缓慢恢复
+      }
+      cov_diag.degrade_cnt = cov_degrade_cnt_;
+
+      // 连续超限累计超过阈值 且 过冷却期 → 触发 Odin1 SLAM 复位
       auto now = this->now();
-      if ((now - last_reset_time_).seconds() > reset_cooldown_sec_) {
-        // 冷却期内不重复触发
-        if (checkCovarianceDeagation(
-              odom->pose.covariance,
-              cov_pos_threshold_, cov_att_threshold_deg2_, cov_degrade_bound_))
-        {
-          RCLCPP_WARN(get_logger(),
-            "Covariance degraded! Triggering Odin SLAM reset");
-          // 写复位命令到文件，Odin1 驱动 10Hz 轮询此文件
-          std::ofstream cmd("/tmp/odin_command.txt", std::ios::trunc);
-          if (cmd.is_open()) {
-            cmd << "set algo_reset 1\n";
-            cmd.close();
-            last_reset_time_ = now;
-          } else {
-            RCLCPP_ERROR(get_logger(),
-              "Failed to open /tmp/odin_command.txt for reset command");
-          }
+      if (cov_degrade_cnt_ > cov_degrade_bound_ &&
+          (now - last_reset_time_).seconds() > reset_cooldown_sec_) {
+        RCLCPP_WARN(get_logger(), "Covariance degraded! Triggering Odin SLAM reset");
+        std::ofstream cmd("/tmp/odin_command.txt", std::ios::trunc);
+        if (cmd.is_open()) {
+          cmd << "set algo_reset 1\n";
+          cmd.close();
+          cov_degrade_cnt_ = 0;
+          last_reset_time_ = now;
+          cov_diag.degrade_cnt = 0;
+          cov_diag.reset_triggered = true;
+        } else {
+          RCLCPP_ERROR(get_logger(),
+            "Failed to open /tmp/odin_command.txt for reset command");
         }
       }
     }
+
+    cov_diag_pub_->publish(cov_diag);
 
     // 复位后 1 秒内抑制输出（等待 SLAM 恢复）
     if ((this->now() - last_reset_time_).seconds() <= 1.0) {
@@ -345,6 +351,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr att_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr aligned_pub_;
+  rclcpp::Publisher<acfly_odometry::msg::CovDiag>::SharedPtr cov_diag_pub_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
   tf2_ros::StaticTransformBroadcaster tf_broadcaster_{this};
   tf2_ros::TransformBroadcaster tf_pub_{this};
